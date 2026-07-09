@@ -18,6 +18,21 @@ Public secondary source archive
 
 This repository preserves source provenance. It should not become the place where research interpretation is reviewed, validated or maintained.
 
+## Local sources and reusable objects
+
+A local source can provide evidence for a reusable need, pain point, behaviour, civic need or insight in the structured intelligence repository.
+
+For example, a local SEND inspection report may show that a general SEND pathway need is not being met in one area. That does not make the underlying need local-only, and it does not prove national prevalence or severity.
+
+Use this repository to preserve the local source context:
+
+- which source was used;
+- which part of the source was selected;
+- what locality, publisher and publication context apply;
+- which structured evidence or analysis objects the source later supports.
+
+Use `civic-design-intelligence` for the interpretation work: deciding whether a candidate object is general, umbrella-level, localised, comparative, evidence-only or still immature.
+
 ## What belongs here
 
 Use this repository for:
@@ -80,6 +95,8 @@ A source used in structured analysis should normally have:
 - Do not ingest entire reports exhaustively by default.
 - Do not treat report findings as validated user needs.
 - Do not copy large public corpora into this repository before testing the workflow.
+- Do not treat a local source as proof of national prevalence or severity.
+- Do not create local-only interpretations here when the source may support reusable objects in `civic-design-intelligence`.
 - Do not store sensitive or private material here.
 - Preserve source provenance, publication details and retrieval dates.
 - Keep interpretation in the structured intelligence repository.
