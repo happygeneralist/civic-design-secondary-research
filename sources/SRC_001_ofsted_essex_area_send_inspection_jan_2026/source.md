@@ -25,9 +25,9 @@ organisation_contexts:
   - NHS Mid and South Essex Integrated Care Board
   - NHS Suffolk and North East Essex Integrated Care Board
   - NHS Hertfordshire and West Essex Integrated Care Board
-ingestion_status: candidate
-mapping_status: none
-related_intelligence_source_record:
+ingestion_status: partial
+mapping_status: partial
+related_intelligence_source_record: RS_001_ofsted_essex_area_send_inspection_jan_2026
 review_status: not_reviewed
 ---
 
@@ -76,19 +76,26 @@ Do not treat inspection findings as validated user needs. Findings from this sou
 
 ## Ingestion notes
 
-Ingestion status: candidate.
+Ingestion status: partial.
 
-This source has been added to the public secondary research archive but has not yet been broken into structured evidence objects in `civic-design-intelligence`.
+This source has been partially mapped into structured objects in `civic-design-intelligence` through the first bounded communication-while-waiting slice.
 
-Recommended first ingestion pass:
+The first ingestion pass created:
 
-1. Create a matching source record in `civic-design-intelligence`.
-2. Create a small number of selected evidence extracts.
-3. Link extracts to candidate pain points, user needs, civic needs or insights only where the interpretation is traceable.
-4. Keep review status conservative until human review.
+1. A matching source/study record in `civic-design-intelligence`.
+2. Five selected evidence extracts.
+3. Links from those extracts to one existing candidate pain point.
+
+This source has not been fully ingested. Other candidate extracts remain available for future bounded slices.
 
 ## Related design intelligence records
 
-- Source record: not created yet
-- Evidence objects: none yet
-- Analysis objects: none yet
+- Source record: `RS_001_ofsted_essex_area_send_inspection_jan_2026`
+- Evidence objects:
+  - `EVID_001_ofsted_essex_inconsistent_communication`
+  - `EVID_002_ofsted_essex_support_not_visible`
+  - `EVID_003_ofsted_essex_communication_support_available`
+  - `EVID_004_ofsted_essex_questions_anxieties_unresolved`
+  - `EVID_005_ofsted_essex_communication_while_waiting`
+- Analysis objects:
+  - `PP_002_parent_carries_pathway_navigation_burden`

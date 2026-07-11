@@ -4,6 +4,18 @@ Use this file for candidate extracts or notes from the source before selected ex
 
 Extracts here are not canonical evidence objects.
 
+## Mapping status note
+
+The first bounded communication-while-waiting slice has now been partially mapped into `civic-design-intelligence`.
+
+Mapped candidate extracts:
+
+- Extract 003 maps partly to `EVID_001_ofsted_essex_inconsistent_communication` and `EVID_002_ofsted_essex_support_not_visible`.
+- Extract 007 maps partly to `EVID_003_ofsted_essex_communication_support_available` and `EVID_004_ofsted_essex_questions_anxieties_unresolved`.
+- Extract 008 maps to `EVID_005_ofsted_essex_communication_while_waiting`.
+
+Other extracts remain candidates for future bounded slices.
+
 ## Extract 001: Inconsistent experiences and outcomes
 
 Source location:
@@ -61,6 +73,8 @@ Candidate evidence for a pain point and civic need. Further extraction should di
 ```
 
 ## Extract 003: Inconsistent communication and awareness of support
+
+Mapping status: partially mapped to `civic-design-intelligence` as `EVID_001_ofsted_essex_inconsistent_communication` and `EVID_002_ofsted_essex_support_not_visible`.
 
 Source location:
 
@@ -174,6 +188,8 @@ Candidate evidence for service coordination and planning quality. More likely to
 
 ## Extract 007: Families pushing hard for support
 
+Mapping status: partially mapped to `civic-design-intelligence` as `EVID_003_ofsted_essex_communication_support_available` and `EVID_004_ofsted_essex_questions_anxieties_unresolved` for the communication-while-waiting slice only. The wider escalation, complaints and `push hard` material remains a candidate for a later bounded slice.
+
 Source location:
 
 ```text
@@ -201,6 +217,8 @@ Strong candidate for pain point extraction. Avoid direct quote unless needed; pa
 ```
 
 ## Extract 008: Areas for improvement on communication
+
+Mapping status: partially mapped to `civic-design-intelligence` as `EVID_005_ofsted_essex_communication_while_waiting`.
 
 Source location:
 
