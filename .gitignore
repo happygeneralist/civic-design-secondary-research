@@ -1,0 +1,7 @@
+# Local collection outputs and raw public-source archives are deliberately not Git content.
+intake/run-output/
+intake/*.json
+*.send-collection/
+send-collection-archive/
+__pycache__/
+.pytest_cache/
