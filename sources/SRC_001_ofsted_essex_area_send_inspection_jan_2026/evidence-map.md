@@ -17,7 +17,7 @@ This is a cross-repository map. It is not the canonical evidence or interpretati
 - Source title: Area SEND inspection of Essex Local Area Partnership
 - Source folder: `sources/SRC_001_ofsted_essex_area_send_inspection_jan_2026/`
 - Public URL: https://files.ofsted.gov.uk/v1/file/50302461
-- Archived file: not stored in this repository
+- Archived file: `original/Essex_Area_SEND_Full_inspection_Jan26.pdf`
 
 ## Design intelligence source record
 

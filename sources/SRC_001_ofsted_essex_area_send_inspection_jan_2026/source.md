@@ -8,7 +8,7 @@ inspection_dates: 2026-01-19 to 2026-01-23
 retrieved_date: 2026-06-16
 public_url: https://files.ofsted.gov.uk/v1/file/50302461
 source_archive_ref: sources/SRC_001_ofsted_essex_area_send_inspection_jan_2026/
-archive_status: referenced_public_url
+archive_status: stored_in_repository
 licence_or_reuse_notes: Reuse permitted under the Open Government Licence, excluding logos, according to the source document.
 geographic_scope:
   - local_area
@@ -44,7 +44,7 @@ This source is relevant to SEND pathway planning, local offer communication, EHC
 ## Source location
 
 - Public URL: https://files.ofsted.gov.uk/v1/file/50302461
-- Archived file: not stored in this repository
+- Archived file: `original/Essex_Area_SEND_Full_inspection_Jan26.pdf`
 - Retrieved date: 2026-06-16
 - Publisher: Ofsted and Care Quality Commission
 - Inspection dates: 2026-01-19 to 2026-01-23
