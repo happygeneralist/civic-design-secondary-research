@@ -93,7 +93,7 @@ python3 scripts/send_collect.py discover-ofsted \
   --execute --accept-terms reports.ofsted.gov.uk --limit 5 --rate-limit 1
 ```
 
-The candidate CSV is compatible with `import-urls` and preserves the provider archive URL, local authority/ONS code, inspection date, publication date and Ofsted report type. Review it before importing it; discovery does not retrieve the linked PDFs.
+The candidate CSV is compatible with `import-urls` and preserves the provider archive URL, local authority/ONS code, raw source label, publication date and Ofsted report type. An inspection date is populated only where it is structurally adjacent to the report-group heading; `inspection_date_evidence` records that limited inference. Otherwise it is intentionally blank/`unconfirmed`. Review the provider page and PDF before relying on a date or importing it; discovery does not retrieve the linked PDFs.
 
 ```bash
 python3 scripts/send_collect.py import-urls \
@@ -131,6 +131,29 @@ python3 scripts/send_collect.py fetch \
   --collection-id official-send-pdf-2026-10-22 --limit 20 --rate-limit 2
 ```
 
+### Archive integrity check
+
+Before a live fetch, the archive root must be a pre-existing durable location outside both this checkout and temporary directories. Do not create a substitute archive under `/tmp` or `/private/tmp`. After a fetch, independently verify that every `state.json` hash has a matching object path whose SHA-256 equals the state key, and retain the resulting count with the fetch run manifest. A missing object, malformed metadata file or mismatched hash is a stop condition: do not continue or overwrite the archive.
+
+The archive location is intentionally not recorded in Git. The operator must provide it at execution time; this read-only command reports object, hash and metadata failures without changing the archive:
+
+```bash
+python3 scripts/send_collect.py verify-archive \
+  --archive-root /durable/external/send-archive --json
+```
+
+## Continuation result: 22 October 2026
+
+The continuation rechecked Ofsted’s [terms of use](https://reports.ofsted.gov.uk/terms-and-conditions) and [copyright notice](https://reports.ofsted.gov.uk/copyright). The site states that most content is Crown copyright under the Open Government Licence, subject to stated exceptions; the operator must still follow the terms and avoid logo reuse. The collector’s current robots check allowed both the `reports.ofsted.gov.uk` provider pages and the `files.ofsted.gov.uk` report URLs (the latter policy resolves through the permitted Ofsted robots redirect).
+
+The originally reviewed five provider pages were re-run at one request per second: 15 labelled SEND reports were found and 10 URLs remained novel after reconciliation with the official manifest. The requested acquisition was **not started**: the stated durable external archive could not be located on the available workstation paths or on Marcel, while the discovered `/private/tmp` archives were empty test artefacts. Therefore the truthful result is **downloaded 0, resumed/skipped 0, blocked 0, failed 0, not-attempted 10**. No archive-integrity claim can be made for an unavailable archive, and the historic “16 externally held” count has not been re-verified in this continuation.
+
+The verified provider mapping now has 25 authorities (the original five plus 20 additions) with exact ONS-code reconciliation against the 153-authority seed. A bounded 25-page pass found 57 labelled SEND reports, 50 URLs novel to the current official manifest, and no provider page without a matching SEND report. This is discovery coverage only: it does not establish that the other 128 authorities lack reports, and it adds no CDI object or evidence claim.
+
+PDF/source-context spot checks found that the provider-page first inspection date can match a multi-day inspection, but a PDF’s letter date is not its publication date. For example, Essex `50141698` says the inspection ran from 30 September to 4 October 2019; Surrey `50076796` is explicitly a joint local-area **revisit** from 18 to 21 March 2019; Hertfordshire `50292409` gives 20 to 22 October 2025; and Barnsley `50302264` gives 2 to 6 February 2026. The provider-page labels/publication dates remain the source context, and raw labels are retained. Do not promote these fields to evidence without document-level review.
+
+To resume safely once the archive path is supplied, first dry-run the ten previously reviewed URLs against that same root, verify the archive as above, then run a small `--source-key` subset at the existing two-second rate. Record the resulting run manifest, SHA-256 values, and downloaded/resumed/blocked/failed counts before expanding further.
+
 ## Site Scraper import for HTML material
 
 The import path accepts CSV with `url` and optional `title`, `captured_at`, `collection_id`, plus one of `content_path`, `text` or `html`. A `content_path` must stay within the export directory. Captures remain labelled as externally supplied material and are never represented as a direct download or a PDF.
@@ -159,11 +182,11 @@ python3 scripts/send_collect.py export-metadata \
 
 The report retains durable archive counts as well as latest-run counts. Acquisition success does not validate a document or create CDI evidence.
 
-## Pilot result: 22 October 2026
+## Earlier pilot record: 22 October 2026
 
 The reviewed batch has 21 direct PDF candidates: 17 Ofsted/CQC area SEND reports (including the CDI-held Essex report) and four DfE research/evaluation PDFs. It covers 17 of the directory's 153 authorities at the candidate stage.
 
-The dry-run selected eight records: seven were ready for retrieval and the CDI-held Essex report was skipped. After checking the current [GOV.UK terms and conditions](https://www.gov.uk/help/terms-conditions) and [Ofsted copyright terms](https://reports.ofsted.gov.uk/copyright), and acknowledging the relevant hosts on the command line, the live pilot stored 13 Ofsted/CQC PDFs (two more were resumed/skipped because they were already archived). The durable external archive now holds 16 Ofsted/CQC PDFs across 16 authorities, plus three pre-existing GOV.UK HTML originals retained from the earlier pilot.
+The dry-run selected eight records: seven were ready for retrieval and the CDI-held Essex report was skipped. Earlier run notes reported 13 stored Ofsted/CQC PDFs (with two resumed/skipped) and 16 externally held Ofsted/CQC PDFs across 16 authorities, plus three pre-existing GOV.UK HTML originals. Those historical holdings must be re-verified against the actual durable archive before they are used as a current count.
 
 The four DfE PDF URLs on `assets.publishing.service.gov.uk` were deliberately blocked in the initial pilot because the host returned HTTP 404 for `robots.txt`; no workaround was attempted. The collector now implements the narrow RFC 9309 treatment for that result: only `404` and `410` mean no robots rules were found, after the existing host, terms and request-safety controls pass. `401`, `403`, `429`, other 4xx responses, 5xx responses, timeouts and unsafe redirects remain blocked.
 
