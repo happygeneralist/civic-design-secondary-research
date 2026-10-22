@@ -21,10 +21,11 @@ import urllib.request
 import urllib.robotparser
 from collections import Counter
 from datetime import datetime, timezone
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, Iterable
 
-VERSION = "0.3.0"
+VERSION = "0.3.1"
 DIRECT_CLASSES = {"direct_pdf", "direct_html", "direct_data"}
 AUTOMATED_DOCUMENT_CLASSES = {"direct_pdf", "direct_data"}
 # reports.ofsted.gov.uk is included solely because files.ofsted.gov.uk redirects
@@ -39,6 +40,21 @@ PRIVATE_NETWORKS = (
     ipaddress.ip_network("172.16.0.0/12"), ipaddress.ip_network("192.168.0.0/16"),
     ipaddress.ip_network("169.254.0.0/16"), ipaddress.ip_network("::1/128"),
     ipaddress.ip_network("fc00::/7"), ipaddress.ip_network("fe80::/10"),
+)
+OFSTED_PROVIDER_HOST = "reports.ofsted.gov.uk"
+OFSTED_REPORT_HOST = "files.ofsted.gov.uk"
+DATE_RE = re.compile(r"\b\d{1,2} [A-Z][a-z]+ \d{4}\b")
+SEND_REPORT_TYPES = (
+    "area send full inspection", "area send monitoring inspection",
+    "local area send inspection", "area send inspection",
+    "area send follow-up", "area send revisit",
+)
+URL_CANDIDATE_FIELDS = (
+    "source_key", "title", "url", "source_class", "publisher",
+    "local_authority", "ons_code", "source_verification", "rights_check",
+    "discovery_parent_url", "collection_id", "inspection_date",
+    "inspection_date_evidence", "publication_date", "report_type", "source_label",
+    "provider_archive_url", "notes",
 )
 
 
@@ -164,6 +180,12 @@ def verified_url_records(path: Path) -> list[dict[str, Any]]:
                 "rights_check": row["rights_check"].strip(),
                 "discovery_parent_url": canonical_url(parent) if parent else None,
                 "collection_id": (row.get("collection_id") or "").strip() or None,
+                "inspection_date": (row.get("inspection_date") or "").strip() or None,
+                "inspection_date_evidence": (row.get("inspection_date_evidence") or "").strip() or None,
+                "publication_date": (row.get("publication_date") or "").strip() or None,
+                "report_type": (row.get("report_type") or "").strip() or None,
+                "source_label": (row.get("source_label") or "").strip() or None,
+                "provider_archive_url": canonical_url(row["provider_archive_url"]) if (row.get("provider_archive_url") or "").strip() else None,
                 "seed_provenance": path.name, "import_provenance": [{"input": path.name, "row": row_number}],
                 "repository_archive_ref": None, "notes": (row.get("notes") or "").strip(),
             })
@@ -198,6 +220,205 @@ def merge_manifest(manifest: dict[str, Any], imported: list[dict[str, Any]]) -> 
     result["counts"].update(total_records=len(result["records"]), imported_url_records=added, merged_url_records=merged)
     result["created_at"] = now()
     return result
+
+
+class OfstedProviderArchiveParser(HTMLParser):
+    """Extract labelled direct-report links from one Ofsted provider archive."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self._active_heading: str | None = None
+        self._pending_inspection_date: str | None = None
+        self._pending_date_from_heading = False
+        self._in_anchor = False
+        self._anchor_href: str | None = None
+        self._anchor_date: str | None = None
+        self._anchor_date_evidence: str | None = None
+        self._anchor_text: list[str] = []
+        self.links: list[dict[str, str | None]] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        tag = tag.lower()
+        if tag in {"h1", "h2", "h3", "h4", "h5", "h6"}:
+            self._active_heading = tag
+        if tag == "a":
+            attributes = dict(attrs)
+            self._in_anchor = True
+            self._anchor_href = attributes.get("href")
+            self._anchor_date = self._pending_inspection_date if self._pending_date_from_heading else None
+            self._anchor_date_evidence = "adjacent_report_group_heading" if self._anchor_date else "unconfirmed"
+            self._anchor_text = []
+
+    def handle_data(self, data: str) -> None:
+        text = " ".join(data.split())
+        if not text:
+            return
+        if self._in_anchor:
+            self._anchor_text.append(text)
+            return
+        if self._active_heading:
+            dates = DATE_RE.findall(text)
+            if dates:
+                self._pending_inspection_date = dates[-1]
+                self._pending_date_from_heading = True
+            return
+        # Do not let generic page text leak a date into a later report link.  A
+        # heading is the only structural association that this lightweight parser
+        # accepts; all other text makes the association unconfirmed.
+        self._pending_inspection_date = None
+        self._pending_date_from_heading = False
+
+    def handle_endtag(self, tag: str) -> None:
+        tag = tag.lower()
+        if tag == "a" and self._in_anchor:
+            self.links.append({"href": self._anchor_href, "label": " ".join(self._anchor_text),
+                               "inspection_date": self._anchor_date,
+                               "inspection_date_evidence": self._anchor_date_evidence})
+            self._in_anchor = False
+            self._anchor_href = None
+            self._anchor_date = None
+            self._anchor_date_evidence = None
+            self._anchor_text = []
+        if tag == self._active_heading:
+            self._active_heading = None
+
+
+def ofsted_report_type(label: str) -> str | None:
+    normalised = " ".join(label.lower().split())
+    for report_type in SEND_REPORT_TYPES:
+        if report_type in normalised:
+            return report_type.title().replace("Send", "SEND")
+    return None
+
+
+def parse_ofsted_provider_archive(html: str, provider_archive_url: str) -> list[dict[str, str | None]]:
+    """Return only SEND-labelled direct PDF links; unrelated reports are ignored."""
+    parser = OfstedProviderArchiveParser()
+    parser.feed(html); parser.close()
+    candidates: list[dict[str, str | None]] = []
+    seen: set[str] = set()
+    for link in parser.links:
+        label = link["label"] or ""
+        report_type = ofsted_report_type(label)
+        if not report_type or not link["href"]:
+            continue
+        pdf_url = canonical_url(urllib.parse.urljoin(provider_archive_url, link["href"]))
+        if host_for(pdf_url) != OFSTED_REPORT_HOST or not urllib.parse.urlsplit(pdf_url).path.startswith("/v1/file/"):
+            continue
+        if pdf_url in seen:
+            continue
+        seen.add(pdf_url)
+        dates = DATE_RE.findall(label)
+        candidates.append({"url": pdf_url, "report_type": report_type,
+                           "inspection_date": link["inspection_date"],
+                           "inspection_date_evidence": link["inspection_date_evidence"],
+                           "publication_date": dates[-1] if dates else None,
+                           "source_label": label})
+    return candidates
+
+
+def load_ofsted_provider_archives(path: Path, authorities_path: Path) -> list[dict[str, str]]:
+    authority_by_ons = {row["ONS code"]: row["Local authority"] for row in load_csv(authorities_path)}
+    records: list[dict[str, str]] = []
+    for row_number, row in enumerate(load_csv(path), start=2):
+        try:
+            for field in ("local_authority", "ons_code", "provider_archive_url", "association_verification"):
+                if not (row.get(field) or "").strip():
+                    raise CollectionError(f"{field} is required")
+            ons_code = row["ons_code"].strip()
+            if authority_by_ons.get(ons_code) != row["local_authority"].strip():
+                raise CollectionError("local_authority does not match the 153-authority seed for this ONS code")
+            archive_url = canonical_url(row["provider_archive_url"])
+            parsed = urllib.parse.urlsplit(archive_url)
+            if host_for(archive_url) != OFSTED_PROVIDER_HOST or not re.fullmatch(r"/provider/44/[0-9]+/?", parsed.path):
+                raise CollectionError("provider_archive_url must be a verified reports.ofsted.gov.uk/provider/44/<id> URL")
+            records.append({"local_authority": row["local_authority"].strip(), "ons_code": ons_code,
+                            "provider_archive_url": archive_url,
+                            "association_verification": row["association_verification"].strip(),
+                            "notes": (row.get("notes") or "").strip()})
+        except CollectionError as exc:
+            raise CollectionError(f"{path}:{row_number}: {exc}") from exc
+    if not records:
+        raise CollectionError(f"{path}: no verified Ofsted provider archives supplied")
+    return records
+
+
+def write_url_candidates(path: Path, records: list[dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=URL_CANDIDATE_FIELDS, extrasaction="ignore")
+        writer.writeheader(); writer.writerows(records)
+
+
+def discover_ofsted(provider_records: list[dict[str, str]], manifest: dict[str, Any], args: argparse.Namespace) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Bounded discovery from verified provider archives; never downloads reports."""
+    events: list[dict[str, Any]] = []
+    output: list[dict[str, Any]] = []
+    known_urls = {record.get("document_url") for record in manifest["records"] if record.get("document_url")}
+    archive_root = getattr(args, "archive_root", None)
+    if archive_root:
+        archive = external_archive_root(Path(archive_root), Path(args.repo_root))
+        state = archive_state(archive)
+        known_urls.update(value for source in state["sources"].values() for value in (source.get("original_url"), source.get("final_url")) if value)
+        known_urls.update(state["url_aliases"].keys()); known_urls.update(state["url_aliases"].values())
+    output_by_url: dict[str, dict[str, Any]] = {}
+    cross_authority_urls: set[str] = set()
+    accepted_terms = {value.lower() for value in args.accept_terms}
+    collection_id = args.collection_id or f"ofsted-provider-discovery-{datetime.now(timezone.utc).date().isoformat()}"
+    for provider in provider_records[:args.limit]:
+        archive_url = provider["provider_archive_url"]
+        event: dict[str, Any] = {"at": now(), "provider_archive_url": archive_url, "local_authority": provider["local_authority"], "ons_code": provider["ons_code"]}
+        if not args.execute:
+            event.update(status="dry_run", reason="use --execute after checking host terms to retrieve provider archive"); events.append(event); continue
+        if OFSTED_PROVIDER_HOST not in accepted_terms:
+            event.update(status="blocked", reason="terms not acknowledged; pass --accept-terms reports.ofsted.gov.uk after checking terms and reuse conditions"); events.append(event); continue
+        try:
+            safe_url = assert_safe_url(archive_url, TRUSTED_FETCH_HOSTS)
+            allowed, robots_note = robots_permission(safe_url, args.timeout)
+            if allowed is not True:
+                event.update(status="blocked", reason=robots_note if allowed is False else f"{robots_note}; use no bypass; try later"); events.append(event); continue
+            final_url, body, content_type = read_response(safe_url, timeout=args.timeout, max_bytes=args.max_bytes)
+            snippet = body[:8192].decode("utf-8", errors="ignore").lower()
+            if content_type not in {"text/html", "application/xhtml+xml"} or "<html" not in snippet:
+                raise CollectionError("expected an HTML Ofsted provider archive response")
+            found = parse_ofsted_provider_archive(body.decode("utf-8", errors="replace"), final_url)
+            novel = known = cross_authority = 0
+            for candidate in found:
+                url = candidate["url"] or ""
+                if url in cross_authority_urls:
+                    cross_authority += 1
+                    continue
+                existing = output_by_url.get(url)
+                if existing:
+                    if existing["ons_code"] != provider["ons_code"]:
+                        cross_authority += 1
+                        output.remove(existing); del output_by_url[url]; cross_authority_urls.add(url)
+                    continue
+                if url in known_urls:
+                    known += 1
+                    continue
+                report_type = candidate["report_type"] or "Area SEND inspection"
+                row = {"source_key": stable_source_key(f"ofsted-{provider['ons_code'].lower()}", url),
+                       "title": f"{provider['local_authority']} {report_type}", "url": url,
+                       "source_class": "direct_pdf", "publisher": "Ofsted and CQC",
+                       "local_authority": provider["local_authority"], "ons_code": provider["ons_code"],
+                       "source_verification": f"official_ofsted_provider_archive_{datetime.now(timezone.utc).date().isoformat()}",
+                       "rights_check": "Ofsted copyright/OGL; check current publisher terms before execute",
+                       "discovery_parent_url": final_url, "collection_id": collection_id,
+                       "inspection_date": candidate["inspection_date"] or "", "publication_date": candidate["publication_date"] or "",
+                       "inspection_date_evidence": candidate["inspection_date_evidence"] or "unconfirmed",
+                       "report_type": report_type, "source_label": candidate["source_label"] or "",
+                       "provider_archive_url": final_url,
+                       "notes": f"Provider association verified: {provider['association_verification']}. {provider['notes']}".strip()}
+                output.append(row); output_by_url[url] = row; novel += 1
+            event.update(status="discovered", robots=robots_note, reports_found=len(found), novel_urls=novel,
+                         known_urls=known, cross_authority_collisions=cross_authority, final_url=final_url)
+        except (CollectionError, urllib.error.URLError, TimeoutError) as exc:
+            event.update(status="blocked" if "robots" in str(exc).lower() else "failed", reason=str(exc))
+        events.append(event)
+        if args.rate_limit > 0:
+            time.sleep(args.rate_limit)
+    return events, output
 
 
 def catalogue(authorities_path: Path, direct_path: Path) -> dict[str, Any]:
@@ -266,6 +487,9 @@ def archive_bytes(root: Path, state: dict[str, Any], *, source_key: str, origina
     relationship = {"source_key": source_key, "original_url": canonical_url(original_url), "final_url": canonical_url(final_url),
                     "collected_at": now(), "collection_provenance": metadata.get("collection_provenance"),
                     "discovery_parent_url": metadata.get("discovery_parent_url"), "collection_id": metadata.get("collection_id"),
+                    "inspection_date": metadata.get("inspection_date"), "publication_date": metadata.get("publication_date"),
+                    "inspection_date_evidence": metadata.get("inspection_date_evidence"), "report_type": metadata.get("report_type"),
+                    "source_label": metadata.get("source_label"), "provider_archive_url": metadata.get("provider_archive_url"),
                     "crawler_metadata": metadata.get("crawler_metadata")}
     relationship = {key: value for key, value in relationship.items() if value is not None}
     existing = state["hashes"].get(digest)
@@ -410,7 +634,8 @@ def pdf_candidate_rows(manifest: dict[str, Any], collection_id: str | None = Non
         rows.append({key: record.get(key) or "" for key in (
             "source_key", "title", "document_url", "source_class", "publisher",
             "local_authority", "ons_code", "source_verification", "rights_check",
-            "discovery_parent_url", "collection_id", "notes",
+            "discovery_parent_url", "collection_id", "inspection_date", "publication_date",
+            "inspection_date_evidence", "report_type", "source_label", "provider_archive_url", "notes",
         )})
     return rows
 
@@ -451,7 +676,7 @@ def fetch(manifest: dict[str, Any], root: Path, args: argparse.Namespace) -> tup
                     final_url, body, content_type = read_response(url, timeout=args.timeout, max_bytes=args.max_bytes)
                     validate_response(record, body, content_type)
                     status, stored = archive_bytes(root, state, source_key=record["source_key"], original_url=url, final_url=final_url,
-                                                   body=body, content_type=content_type, metadata={"collection_provenance": record.get("seed_provenance", "direct seed"), "publisher": record["publisher"], "local_authority": record["local_authority"], "ons_code": record["ons_code"], "source_class": record["source_class"], "source_verification": record["source_verification"], "rights_check": record.get("rights_check"), "discovery_parent_url": record.get("discovery_parent_url"), "collection_id": record.get("collection_id"), "robots": robots_note})
+                                                   body=body, content_type=content_type, metadata={"collection_provenance": record.get("seed_provenance", "direct seed"), "publisher": record["publisher"], "local_authority": record["local_authority"], "ons_code": record["ons_code"], "source_class": record["source_class"], "source_verification": record["source_verification"], "rights_check": record.get("rights_check"), "discovery_parent_url": record.get("discovery_parent_url"), "collection_id": record.get("collection_id"), "inspection_date": record.get("inspection_date"), "inspection_date_evidence": record.get("inspection_date_evidence"), "publication_date": record.get("publication_date"), "report_type": record.get("report_type"), "source_label": record.get("source_label"), "provider_archive_url": record.get("provider_archive_url"), "robots": robots_note})
                     stored.pop("status", None)
                     event.update(status=status, final_url=final_url, content_type=content_type, bytes=len(body), **stored); last_error = None; break
                 except (CollectionError, urllib.error.URLError, TimeoutError) as exc:
@@ -562,7 +787,8 @@ def metadata_export(root: Path) -> dict[str, Any]:
     entries: list[dict[str, Any]] = []
     permitted = {"sha256", "bytes", "first_source_key", "original_url", "final_url", "content_type", "retrieved_at",
                  "collection_provenance", "publisher", "local_authority", "ons_code", "source_verification", "robots",
-                 "acquisition_note", "crawler_metadata", "rights_check", "relationships"}
+                 "acquisition_note", "crawler_metadata", "rights_check", "inspection_date", "publication_date",
+                 "inspection_date_evidence", "report_type", "source_label", "provider_archive_url", "relationships"}
     for path in sorted((root / "objects").glob("*/metadata.json")):
         try:
             metadata = json.loads(path.read_text(encoding="utf-8"))
@@ -570,6 +796,42 @@ def metadata_export(root: Path) -> dict[str, Any]:
         except (OSError, json.JSONDecodeError):
             continue
     return {"schema_version": 1, "exported_at": now(), "purpose": "metadata-only source acquisition export; original bytes and local archive paths omitted", "sources": entries}
+
+
+def verify_archive(root: Path) -> dict[str, Any]:
+    """Read every archived object and verify its state and metadata references."""
+    archive = root.resolve()
+    state = archive_state(archive)
+    events: list[dict[str, Any]] = []
+    for digest, entry in sorted(state["hashes"].items()):
+        event: dict[str, Any] = {"sha256": digest, "status": "failed"}
+        try:
+            if not re.fullmatch(r"[0-9a-f]{64}", digest):
+                raise CollectionError("state hash is not a SHA-256 digest")
+            relative = Path(entry.get("archive_path", ""))
+            target = (archive / relative).resolve()
+            if archive not in target.parents or not target.is_file():
+                raise CollectionError("object path is missing, unsafe, or not a regular file")
+            hasher = hashlib.sha256()
+            with target.open("rb") as handle:
+                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    hasher.update(chunk)
+            if hasher.hexdigest() != digest:
+                raise CollectionError("object SHA-256 does not match state")
+            metadata_path = target.parent / "metadata.json"
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            if metadata.get("sha256") != digest or metadata.get("archive_path") != relative.as_posix():
+                raise CollectionError("metadata does not match state")
+            event.update(status="valid", archive_path=relative.as_posix(), bytes=target.stat().st_size)
+        except (CollectionError, OSError, json.JSONDecodeError) as exc:
+            event["reason"] = str(exc)
+        events.append(event)
+    source_digests = {value.get("sha256") for value in state["sources"].values()}
+    orphaned_source_refs = sorted(digest for digest in source_digests if digest and digest not in state["hashes"])
+    return {"schema_version": 1, "checked_at": now(), "objects": len(events),
+            "valid": sum(event["status"] == "valid" for event in events),
+            "failed": sum(event["status"] == "failed" for event in events),
+            "orphaned_source_refs": orphaned_source_refs, "events": events}
 
 
 def print_summary(label: str, events: list[dict[str, Any]], run: Path) -> None:
@@ -604,6 +866,19 @@ def main(argv: list[str] | None = None) -> int:
     candidates_parser.add_argument("--manifest", type=Path)
     candidates_parser.add_argument("--collection-id", help="only list a named imported batch")
     candidates_parser.add_argument("--output", required=True, type=Path)
+    ofsted_parser = sub.add_parser("discover-ofsted", help="discover labelled SEND PDF links from verified Ofsted provider archives; never downloads PDFs")
+    ofsted_parser.add_argument("--input", required=True, type=Path, help="verified authority-to-provider-archive CSV")
+    ofsted_parser.add_argument("--manifest", type=Path, help="manifest used to exclude already-known PDF URLs")
+    ofsted_parser.add_argument("--archive-root", type=Path, help="optional external archive used to exclude already-held source URLs")
+    ofsted_parser.add_argument("--output", required=True, type=Path, help="review CSV compatible with import-urls")
+    ofsted_parser.add_argument("--run-root", type=Path, help="optional location for discovery run JSON; no source bytes are written")
+    ofsted_parser.add_argument("--collection-id", help="collection ID written to newly discovered candidates")
+    ofsted_parser.add_argument("--execute", action="store_true", help="explicitly permit bounded provider-archive requests")
+    ofsted_parser.add_argument("--accept-terms", action="append", default=[], metavar="HOST", help="host whose terms/reuse rules you have checked")
+    ofsted_parser.add_argument("--limit", type=int, default=10)
+    ofsted_parser.add_argument("--timeout", type=float, default=20.0)
+    ofsted_parser.add_argument("--max-bytes", type=int, default=2 * 1024 * 1024)
+    ofsted_parser.add_argument("--rate-limit", type=float, default=1.0)
     fetch_parser = sub.add_parser("fetch", help="fetch direct document candidates only; dry-run by default")
     fetch_parser.add_argument("--manifest", type=Path)
     fetch_parser.add_argument("--archive-root", required=True, type=Path)
@@ -629,6 +904,9 @@ def main(argv: list[str] | None = None) -> int:
     export_parser = sub.add_parser("export-metadata", help="write a publishable metadata-only archive export")
     export_parser.add_argument("--archive-root", required=True, type=Path)
     export_parser.add_argument("--output", required=True, type=Path)
+    verify_parser = sub.add_parser("verify-archive", help="read-only verification of archived object and metadata hashes")
+    verify_parser.add_argument("--archive-root", required=True, type=Path)
+    verify_parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
     try:
         if args.command == "catalogue":
@@ -642,6 +920,19 @@ def main(argv: list[str] | None = None) -> int:
             rows = pdf_candidate_rows(load_manifest_or_catalogue(args), args.collection_id)
             write_pdf_candidates(args.output, rows)
             print(f"wrote {len(rows)} direct PDF/data candidates for review: {args.output}")
+        elif args.command == "discover-ofsted":
+            authority, _ = default_paths(args.repo_root)
+            providers = load_ofsted_provider_archives(args.input, authority)
+            manifest = load_manifest_or_catalogue(args)
+            events, candidates = discover_ofsted(providers, manifest, args)
+            write_url_candidates(args.output, candidates)
+            unmatched = sorted(event["local_authority"] for event in events if event["status"] == "discovered" and not event["reports_found"])
+            run_root = args.run_root or args.output.parent
+            run = write_run(run_root, "discover-ofsted", events, {"archives_requested": len(providers), "archives_visited": sum(event["status"] == "discovered" for event in events), "candidates_found": sum(event.get("reports_found", 0) for event in events), "novel_urls": len(candidates), "unmatched_authorities": unmatched})
+            counts = Counter(event["status"] for event in events)
+            print("discover-ofsted: " + ", ".join(f"{key}={counts[key]}" for key in sorted(counts)) + f", candidates_found={sum(event.get('reports_found', 0) for event in events)}, novel_urls={len(candidates)}, unmatched_authorities={len(unmatched)}")
+            print(f"candidate CSV: {args.output}")
+            print(f"run manifest: {run}")
         elif args.command == "fetch":
             archive = external_archive_root(args.archive_root, args.repo_root)
             manifest = load_manifest_or_catalogue(args); events, run = fetch(manifest, archive, args); print_summary("fetch", events, run)
@@ -664,6 +955,12 @@ def main(argv: list[str] | None = None) -> int:
             archive = external_archive_root(args.archive_root, args.repo_root)
             export = metadata_export(archive); json_dump(args.output, export)
             print(f"exported {len(export['sources'])} metadata-only source records: {args.output}")
+        elif args.command == "verify-archive":
+            report = verify_archive(external_archive_root(args.archive_root, args.repo_root))
+            if args.json:
+                print(json.dumps(report, indent=2, sort_keys=True))
+            else:
+                print(f"objects={report['objects']} valid={report['valid']} failed={report['failed']} orphaned_source_refs={len(report['orphaned_source_refs'])}")
     except (CollectionError, OSError, json.JSONDecodeError) as exc:
         print(f"error: {exc}", file=sys.stderr); return 2
     return 0
