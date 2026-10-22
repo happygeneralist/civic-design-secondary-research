@@ -72,6 +72,48 @@ python3 scripts/send_collect.py status \
 
 `discover-pdfs` and `fetch` select only `direct_pdf` and `direct_data` records. Verified direct official PDF/data URLs can be submitted through `import-urls` only on the narrowly approved publisher hosts. Directory, search and collection URLs are refused.
 
+## Discover SEND PDFs from verified Ofsted provider archives
+
+`discover-ofsted` is the bounded online discovery step. It only visits a supplied CSV of authority-to-provider-page associations that have been independently verified against the 153-authority seed. It requests the provider pages only after terms acknowledgement and robots approval, extracts only labelled area/local SEND inspection or SEND monitoring/follow-up PDF links, and writes no report bytes.
+
+Start by reconciling against the maintained PDF candidate list so that the resulting review CSV contains only URLs not already known to the manifest:
+
+```bash
+python3 scripts/send_collect.py import-urls \
+  --input intake/batches/official_send_pdf_candidates_2026-10-22.csv \
+  --manifest intake/run-output/send-manifest.json \
+  --output intake/run-output/official-send-pdf-manifest.json
+
+python3 scripts/send_collect.py discover-ofsted \
+  --input intake/seeds/ofsted_provider_archives_pilot.csv \
+  --manifest intake/run-output/official-send-pdf-manifest.json \
+  --archive-root /path/outside/git/send-archive \
+  --output intake/run-output/ofsted-send-novel-candidates.csv \
+  --run-root /path/outside/git/send-discovery-runs \
+  --execute --accept-terms reports.ofsted.gov.uk --limit 5 --rate-limit 1
+```
+
+The candidate CSV is compatible with `import-urls` and preserves the provider archive URL, local authority/ONS code, inspection date, publication date and Ofsted report type. Review it before importing it; discovery does not retrieve the linked PDFs.
+
+```bash
+python3 scripts/send_collect.py import-urls \
+  --input intake/run-output/ofsted-send-novel-candidates.csv \
+  --manifest intake/run-output/official-send-pdf-manifest.json \
+  --output intake/run-output/discovered-ofsted-manifest.json
+
+python3 scripts/send_collect.py discover-pdfs \
+  --manifest intake/run-output/discovered-ofsted-manifest.json \
+  --collection-id ofsted-provider-discovery-YYYY-MM-DD \
+  --output intake/run-output/discovered-ofsted-review.csv
+
+python3 scripts/send_collect.py fetch \
+  --manifest intake/run-output/discovered-ofsted-manifest.json \
+  --archive-root /path/outside/git/send-archive \
+  --collection-id ofsted-provider-discovery-YYYY-MM-DD --limit 10
+```
+
+Only after that dry-run review and a separate `files.ofsted.gov.uk` terms acknowledgement should an approved subset be fetched. The discovery run reports visited provider archives, SEND candidates found, novel URLs and any authority pages with no matching SEND report; it does not infer that the remaining authorities lack an inspection.
+
 ## Expanding coverage safely
 
 For each authority, use the directory as a starting point to find an individual, direct official PDF. Review the document URL, publisher, licence/terms, provenance and authority identifier, then add one CSV row matching `official_send_pdf_candidates_2026-10-22.csv`. Do not add a category page, search results page or a general Local Offer page.
@@ -124,3 +166,5 @@ The reviewed batch has 21 direct PDF candidates: 17 Ofsted/CQC area SEND reports
 The dry-run selected eight records: seven were ready for retrieval and the CDI-held Essex report was skipped. After checking the current [GOV.UK terms and conditions](https://www.gov.uk/help/terms-conditions) and [Ofsted copyright terms](https://reports.ofsted.gov.uk/copyright), and acknowledging the relevant hosts on the command line, the live pilot stored 13 Ofsted/CQC PDFs (two more were resumed/skipped because they were already archived). The durable external archive now holds 16 Ofsted/CQC PDFs across 16 authorities, plus three pre-existing GOV.UK HTML originals retained from the earlier pilot.
 
 The four DfE PDF URLs on `assets.publishing.service.gov.uk` were deliberately blocked in the initial pilot because the host returned HTTP 404 for `robots.txt`; no workaround was attempted. The collector now implements the narrow RFC 9309 treatment for that result: only `404` and `410` mean no robots rules were found, after the existing host, terms and request-safety controls pass. `401`, `403`, `429`, other 4xx responses, 5xx responses, timeouts and unsafe redirects remain blocked.
+
+The five-page Ofsted provider-archive discovery pilot visited all five verified pages, found 15 labelled SEND PDF links and produced 10 novel URLs after reconciliation with the maintained official-PDF manifest. It downloaded no new report bytes.

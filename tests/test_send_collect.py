@@ -177,6 +177,44 @@ class SendCollectTests(unittest.TestCase):
                 allowed, note = collector.robots_permission(target, 1)
                 self.assertIsNone(allowed); self.assertIn("timed out", note)
 
+    def test_provider_archive_parser_keeps_only_labelled_send_pdfs_and_dates(self) -> None:
+        html = (ROOT / "tests/fixtures/ofsted-provider-archive.html").read_text()
+        records = collector.parse_ofsted_provider_archive(html, "https://reports.ofsted.gov.uk/provider/44/99999")
+        self.assertEqual([record["url"] for record in records], [
+            "https://files.ofsted.gov.uk/v1/file/50300001",
+            "https://files.ofsted.gov.uk/v1/file/50300002",
+            "https://files.ofsted.gov.uk/v1/file/50300004",
+        ])
+        self.assertEqual(records[0]["report_type"], "Area SEND Full Inspection")
+        self.assertEqual(records[0]["inspection_date"], "19 January 2026")
+        self.assertEqual(records[0]["publication_date"], "20 May 2026")
+        self.assertNotIn("50300003", {record["url"] for record in records})
+
+    def test_provider_discovery_reconciles_known_urls_and_rejects_cross_authority_links(self) -> None:
+        html = (ROOT / "tests/fixtures/ofsted-provider-archive.html").read_text().encode()
+        args = SimpleNamespace(execute=True, accept_terms=["reports.ofsted.gov.uk"], collection_id="fixture", limit=10,
+                               timeout=1, max_bytes=100000, rate_limit=0)
+        first = {"local_authority": "Essex", "ons_code": "E10000012", "provider_archive_url": "https://reports.ofsted.gov.uk/provider/44/80468", "association_verification": "fixture", "notes": ""}
+        manifest = {"records": [{"document_url": "https://files.ofsted.gov.uk/v1/file/50300002"}]}
+        with mock.patch.object(collector, "assert_safe_url", side_effect=lambda url, _hosts=None: url), mock.patch.object(collector, "robots_permission", return_value=(True, "checked robots")), mock.patch.object(collector, "read_response", return_value=(first["provider_archive_url"], html, "text/html")):
+            events, candidates = collector.discover_ofsted([first], manifest, args)
+        self.assertEqual(events[0]["reports_found"], 3)
+        self.assertEqual(events[0]["known_urls"], 1)
+        self.assertEqual(len(candidates), 2)
+        candidate_csv = self.work / "provider-candidates.csv"
+        collector.write_url_candidates(candidate_csv, candidates)
+        with mock.patch.object(collector, "assert_safe_url", side_effect=lambda url, _hosts=None: collector.canonical_url(url)):
+            imported = collector.verified_url_records(candidate_csv)
+        self.assertEqual(imported[0]["inspection_date"], "19 January 2026")
+        self.assertEqual(imported[0]["publication_date"], "20 May 2026")
+        self.assertEqual(imported[0]["report_type"], "Area SEND Full Inspection")
+        self.assertEqual(imported[0]["provider_archive_url"], first["provider_archive_url"])
+        second = {**first, "local_authority": "Surrey", "ons_code": "E10000030", "provider_archive_url": "https://reports.ofsted.gov.uk/provider/44/80567"}
+        with mock.patch.object(collector, "assert_safe_url", side_effect=lambda url, _hosts=None: url), mock.patch.object(collector, "robots_permission", return_value=(True, "checked robots")), mock.patch.object(collector, "read_response", side_effect=[(first["provider_archive_url"], html, "text/html"), (second["provider_archive_url"], html, "text/html")]):
+            events, candidates = collector.discover_ofsted([first, second], {"records": []}, args)
+        self.assertEqual(candidates, [])
+        self.assertGreater(events[1]["cross_authority_collisions"], 0)
+
     def test_crawler_collision_and_size_cap_do_not_overwrite(self) -> None:
         exported = self.work / "export"; exported.mkdir()
         (exported / "one.html").write_text("<html>one</html>")
