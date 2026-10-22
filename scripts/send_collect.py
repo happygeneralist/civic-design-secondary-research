@@ -24,11 +24,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 DIRECT_CLASSES = {"direct_pdf", "direct_html", "direct_data"}
+AUTOMATED_DOCUMENT_CLASSES = {"direct_pdf", "direct_data"}
 # reports.ofsted.gov.uk is included solely because files.ofsted.gov.uk redirects
 # its robots policy there; document redirects remain same-host only.
-TRUSTED_FETCH_HOSTS = frozenset({"files.ofsted.gov.uk", "reports.ofsted.gov.uk", "www.gov.uk", "www.lgo.org.uk"})
+TRUSTED_FETCH_HOSTS = frozenset({
+    "files.ofsted.gov.uk", "reports.ofsted.gov.uk", "www.gov.uk",
+    "assets.publishing.service.gov.uk",
+})
 USER_AGENT = "CivicDesignSENDCollector/0.1 (+research source acquisition; contact repository owner)"
 PRIVATE_NETWORKS = (
     ipaddress.ip_network("127.0.0.0/8"), ipaddress.ip_network("10.0.0.0/8"),
@@ -139,8 +143,8 @@ def verified_url_records(path: Path) -> list[dict[str, Any]]:
                 if not (row.get(field) or "").strip():
                     raise CollectionError(f"{field} is required")
             url = assert_safe_url(row["url"], TRUSTED_FETCH_HOSTS)
-            if row["source_class"] not in DIRECT_CLASSES:
-                raise CollectionError("source_class must be direct_pdf, direct_html, or direct_data")
+            if row["source_class"] not in AUTOMATED_DOCUMENT_CLASSES:
+                raise CollectionError("source_class must be direct_pdf or direct_data for automated acquisition")
             if is_discovery_url(url):
                 raise CollectionError("directories, category pages, collections, and searches are not individual document URLs")
             verification = row["source_verification"].strip()
@@ -301,7 +305,8 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
-def read_response(url: str, *, timeout: float, max_bytes: int, allow_cross_host: bool = False) -> tuple[str, bytes, str]:
+def read_response(url: str, *, timeout: float, max_bytes: int,
+                  permitted_cross_host_redirect: tuple[str, str] | None = None) -> tuple[str, bytes, str]:
     # Deliberately ignore environment proxy settings: untrusted URL lists must not
     # turn this process into a request through an arbitrary proxy.
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
@@ -320,7 +325,8 @@ def read_response(url: str, *, timeout: float, max_bytes: int, allow_cross_host:
                 raise CollectionError("redirect without Location")
             current = assert_safe_url(urllib.parse.urljoin(current, location), TRUSTED_FETCH_HOSTS)
             redirected = urllib.parse.urlsplit(current)
-            if ((redirected.hostname != original.hostname and not allow_cross_host) or
+            redirect_pair = (original.hostname or "", redirected.hostname or "")
+            if ((redirected.hostname != original.hostname and redirect_pair != permitted_cross_host_redirect) or
                     (original.scheme == "https" and redirected.scheme != "https")):
                 raise CollectionError("cross-host or HTTPS-to-HTTP redirect blocked; resolve and verify it as a separate source")
             continue
@@ -344,10 +350,11 @@ def robots_permission(url: str, timeout: float) -> tuple[bool | None, str]:
     parsed = urllib.parse.urlsplit(safe)
     robots_url = f"{parsed.scheme}://{parsed.netloc}/robots.txt"
     try:
-        # A host may centralise robots.txt on another explicitly approved official
-        # host. This exception applies only to robots policy retrieval, never source
-        # document acquisition.
-        final, body, _ = read_response(robots_url, timeout=timeout, max_bytes=512_000, allow_cross_host=True)
+        # This narrowly scoped exception covers Ofsted's documented robots redirect.
+        # It applies only to policy retrieval, never to source document acquisition.
+        permitted_redirect = ("files.ofsted.gov.uk", "reports.ofsted.gov.uk") if parsed.hostname == "files.ofsted.gov.uk" else None
+        final, body, _ = read_response(robots_url, timeout=timeout, max_bytes=512_000,
+                                       permitted_cross_host_redirect=permitted_redirect)
     except CollectionError as exc:
         return None, f"robots unavailable: {exc}"
     parser = urllib.robotparser.RobotFileParser()
@@ -387,8 +394,29 @@ def write_run(root: Path, command: str, events: list[dict[str, Any]], extra: dic
 
 
 def select_fetch_records(manifest: dict[str, Any], limit: int | None, keys: set[str], collection_id: str | None = None) -> list[dict[str, Any]]:
-    selected = [record for record in manifest["records"] if record["source_class"] in DIRECT_CLASSES and (not keys or record["source_key"] in keys) and (not collection_id or record.get("collection_id") == collection_id or collection_id in record.get("collection_ids", []))]
+    selected = [record for record in manifest["records"] if record["source_class"] in AUTOMATED_DOCUMENT_CLASSES and (not keys or record["source_key"] in keys) and (not collection_id or record.get("collection_id") == collection_id or collection_id in record.get("collection_ids", []))]
     return selected[:limit] if limit is not None else selected
+
+
+def pdf_candidate_rows(manifest: dict[str, Any], collection_id: str | None = None) -> list[dict[str, Any]]:
+    """Produce an operator-review list without fetching or discovering web pages."""
+    rows: list[dict[str, Any]] = []
+    for record in select_fetch_records(manifest, None, set(), collection_id):
+        rows.append({key: record.get(key) or "" for key in (
+            "source_key", "title", "document_url", "source_class", "publisher",
+            "local_authority", "ons_code", "source_verification", "rights_check",
+            "discovery_parent_url", "collection_id", "notes",
+        )})
+    return rows
+
+
+def write_pdf_candidates(path: Path, rows: list[dict[str, Any]]) -> None:
+    if not rows:
+        raise CollectionError("no direct PDF/data candidates match this selection")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
+        writer.writeheader(); writer.writerows(rows)
 
 
 def fetch(manifest: dict[str, Any], root: Path, args: argparse.Namespace) -> tuple[list[dict[str, Any]], Path]:
@@ -509,11 +537,14 @@ def status_report(manifest: dict[str, Any], root: Path) -> dict[str, Any]:
     latest_outcomes = Counter(event.get("status", "unknown") for event in latest_events)
     source_classes = Counter(record["source_class"] for record in manifest["records"])
     authorities = {record["ons_code"] for record in manifest["records"] if record.get("ons_code")}
+    candidates = pdf_candidate_rows(manifest)
+    candidate_authorities = {row["ons_code"] for row in candidates if row.get("ons_code")}
     held = list(state["sources"].values())
     covered = {entry.get("local_authority") for entry in held if entry.get("local_authority")}
     hosts = Counter(host_for(entry["original_url"]) for entry in held if entry.get("original_url"))
     return {"registered": len(manifest["records"]), "authority_rows": manifest["counts"]["authority_rows"], "discovery_records": manifest["counts"]["discovery_records"],
-            "document_candidates": sum(1 for r in manifest["records"] if r["record_kind"] == "document_candidate"),
+            "document_candidates": len(candidates),
+            "candidate_coverage": {"direct_documents": len(candidates), "authorities": len(candidate_authorities), "known": len(authorities)},
             "archive": {"externally_held_sources": len(held), "unique_content_objects": len(state["hashes"])},
             "latest_run_outcomes": dict(sorted(latest_outcomes.items())), "historical_event_outcomes": dict(sorted(historical_outcomes.items())),
             "outcomes": dict(sorted(latest_outcomes.items())),
@@ -564,6 +595,10 @@ def main(argv: list[str] | None = None) -> int:
     urls_parser.add_argument("--input", required=True, type=Path)
     urls_parser.add_argument("--manifest", type=Path, help="existing manifest; defaults to supplied seed catalogue")
     urls_parser.add_argument("--output", required=True, type=Path)
+    candidates_parser = sub.add_parser("discover-pdfs", help="write direct official PDF/data candidates for human review; does not fetch pages")
+    candidates_parser.add_argument("--manifest", type=Path)
+    candidates_parser.add_argument("--collection-id", help="only list a named imported batch")
+    candidates_parser.add_argument("--output", required=True, type=Path)
     fetch_parser = sub.add_parser("fetch", help="fetch direct document candidates only; dry-run by default")
     fetch_parser.add_argument("--manifest", type=Path)
     fetch_parser.add_argument("--archive-root", required=True, type=Path)
@@ -598,6 +633,10 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "import-urls":
             value = merge_manifest(load_manifest_or_catalogue(args), verified_url_records(args.input)); json_dump(args.output, value)
             print(f"imported {value['counts']['imported_url_records']} verified individual URLs; merged {value['counts']['merged_url_records']}: {args.output}")
+        elif args.command == "discover-pdfs":
+            rows = pdf_candidate_rows(load_manifest_or_catalogue(args), args.collection_id)
+            write_pdf_candidates(args.output, rows)
+            print(f"wrote {len(rows)} direct PDF/data candidates for review: {args.output}")
         elif args.command == "fetch":
             archive = external_archive_root(args.archive_root, args.repo_root)
             manifest = load_manifest_or_catalogue(args); events, run = fetch(manifest, archive, args); print_summary("fetch", events, run)
@@ -610,6 +649,7 @@ def main(argv: list[str] | None = None) -> int:
             if args.json: print(json.dumps(report, indent=2, sort_keys=True))
             else:
                 print(f"registered={report['registered']} discovery={report['discovery_records']} document_candidates={report['document_candidates']}")
+                print(f"candidate_coverage={report['candidate_coverage']['authorities']}/{report['candidate_coverage']['known']} authorities")
                 print("outcomes=" + ", ".join(f"{key}={value}" for key, value in report["outcomes"].items()))
                 print(f"externally_held={report['archive']['externally_held_sources']} unique_objects={report['archive']['unique_content_objects']}")
                 print(f"authority_coverage={report['authority_coverage']['externally_held']}/{report['authority_coverage']['known']}")

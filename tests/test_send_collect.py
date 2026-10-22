@@ -8,6 +8,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -106,9 +107,10 @@ class SendCollectTests(unittest.TestCase):
         with batch.open("w", newline="") as handle:
             writer = csv.DictWriter(handle, fieldnames=["url", "title", "source_class", "publisher", "local_authority", "ons_code", "source_verification", "rights_check", "discovery_parent_url", "collection_id"])
             writer.writeheader()
-            writer.writerow({"url": "https://www.lgo.org.uk/decisions/education/special-educational-needs/25-014-149", "title": "Surrey decision", "source_class": "direct_html", "publisher": "LGSCO", "local_authority": "Surrey", "ons_code": "E10000030", "source_verification": "official_category_verified", "rights_check": "checked", "discovery_parent_url": "https://www.lgo.org.uk/decisions/education/special-educational-needs", "collection_id": "test"})
-            writer.writerow({"url": "https://www.lgo.org.uk/decisions/education/special-educational-needs/25-014-149", "title": "Surrey decision duplicate provenance", "source_class": "direct_html", "publisher": "LGSCO", "local_authority": "Surrey", "ons_code": "E10000030", "source_verification": "official_category_verified", "rights_check": "checked", "discovery_parent_url": "https://www.lgo.org.uk/decisions/education/special-educational-needs", "collection_id": "test-2"})
-        records = collector.verified_url_records(batch)
+            writer.writerow({"url": "https://files.ofsted.gov.uk/v1/file/50233738", "title": "Surrey area SEND inspection", "source_class": "direct_pdf", "publisher": "Ofsted and CQC", "local_authority": "Surrey", "ons_code": "E10000030", "source_verification": "official_direct_pdf_verified", "rights_check": "Open Government Licence stated in report", "discovery_parent_url": "https://reports.ofsted.gov.uk/", "collection_id": "test"})
+            writer.writerow({"url": "https://files.ofsted.gov.uk/v1/file/50233738", "title": "Surrey area SEND inspection duplicate provenance", "source_class": "direct_pdf", "publisher": "Ofsted and CQC", "local_authority": "Surrey", "ons_code": "E10000030", "source_verification": "official_direct_pdf_verified", "rights_check": "Open Government Licence stated in report", "discovery_parent_url": "https://reports.ofsted.gov.uk/", "collection_id": "test-2"})
+        with mock.patch.object(collector, "assert_safe_url", side_effect=lambda url, _hosts=None: collector.canonical_url(url)):
+            records = collector.verified_url_records(batch)
         manifest = collector.merge_manifest(collector.catalogue(ROOT / "intake/seeds/SEND_all_153_local_authorities.csv", ROOT / "intake/seeds/direct_sources.csv"), records)
         self.assertEqual(manifest["counts"]["imported_url_records"], 1)
         self.assertEqual(manifest["counts"]["merged_url_records"], 1)
@@ -117,6 +119,11 @@ class SendCollectTests(unittest.TestCase):
         bad.write_text("url,title,source_class,source_verification,rights_check\nhttps://example.org/search/all,No,direct_html,verified_direct,checked\n")
         with self.assertRaises(collector.CollectionError):
             collector.verified_url_records(bad)
+        html = self.work / "html-urls.csv"
+        html.write_text("url,title,source_class,source_verification,rights_check\nhttps://www.gov.uk/report,No,direct_html,official_direct_html_verified,checked\n")
+        with mock.patch.object(collector, "assert_safe_url", side_effect=lambda url, _hosts=None: collector.canonical_url(url)):
+            with self.assertRaisesRegex(collector.CollectionError, "direct_pdf or direct_data"):
+                collector.verified_url_records(html)
 
     def test_untrusted_hosts_and_archive_inside_checkout_are_rejected(self) -> None:
         with self.assertRaises(collector.CollectionError):
@@ -131,6 +138,24 @@ class SendCollectTests(unittest.TestCase):
             collector.validate_response({"source_class": "direct_html"}, b"<html><title>Access denied</title></html>", "text/html")
         collector.validate_response({"source_class": "direct_pdf"}, b"%PDF-1.7 report", "application/pdf")
         collector.validate_response({"source_class": "direct_html"}, b"<!doctype html><html><body>report</body></html>", "text/html")
+
+    def test_automated_fetch_selection_excludes_html_and_pdf_review_is_explicit(self) -> None:
+        manifest = {"records": [
+            {"source_key": "pdf", "source_class": "direct_pdf", "document_url": "https://files.ofsted.gov.uk/v1/file/1", "title": "PDF", "publisher": "Ofsted", "local_authority": "Essex", "ons_code": "E10000012", "source_verification": "official_direct_pdf_verified", "rights_check": "OGL", "collection_id": "batch", "notes": ""},
+            {"source_key": "html", "source_class": "direct_html", "document_url": "https://www.gov.uk/page", "title": "HTML", "publisher": "GOV.UK", "local_authority": None, "ons_code": None, "source_verification": "official_direct_html_verified", "rights_check": "OGL", "collection_id": "batch", "notes": ""},
+        ]}
+        self.assertEqual([item["source_key"] for item in collector.select_fetch_records(manifest, None, set())], ["pdf"])
+        self.assertEqual([item["source_key"] for item in collector.pdf_candidate_rows(manifest, "batch")], ["pdf"])
+
+    def test_robots_cross_host_exception_is_only_ofsted_pair(self) -> None:
+        def identity(url: str, _hosts: object = None) -> str:
+            return url
+        with mock.patch.object(collector, "assert_safe_url", side_effect=identity), mock.patch.object(collector, "read_response", return_value=("https://reports.ofsted.gov.uk/robots.txt", b"User-agent: *\nAllow: /", "text/plain")) as read:
+            collector.robots_permission("https://files.ofsted.gov.uk/v1/file/1", 1)
+            self.assertEqual(read.call_args.kwargs["permitted_cross_host_redirect"], ("files.ofsted.gov.uk", "reports.ofsted.gov.uk"))
+        with mock.patch.object(collector, "assert_safe_url", side_effect=identity), mock.patch.object(collector, "read_response", return_value=("https://www.gov.uk/robots.txt", b"User-agent: *\nAllow: /", "text/plain")) as read:
+            collector.robots_permission("https://www.gov.uk/report", 1)
+            self.assertIsNone(read.call_args.kwargs["permitted_cross_host_redirect"])
 
     def test_crawler_collision_and_size_cap_do_not_overwrite(self) -> None:
         exported = self.work / "export"; exported.mkdir()
