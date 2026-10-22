@@ -157,6 +157,26 @@ class SendCollectTests(unittest.TestCase):
             collector.robots_permission("https://www.gov.uk/report", 1)
             self.assertIsNone(read.call_args.kwargs["permitted_cross_host_redirect"])
 
+    def test_robots_rfc9309_unavailable_and_unreachable_statuses(self) -> None:
+        def identity(url: str, _hosts: object = None) -> str:
+            return url
+        target = "https://assets.publishing.service.gov.uk/report.pdf"
+        with mock.patch.object(collector, "assert_safe_url", side_effect=identity):
+            with mock.patch.object(collector, "read_response", return_value=("https://assets.publishing.service.gov.uk/robots.txt", b"User-agent: *\nDisallow: /", "text/plain")):
+                allowed, note = collector.robots_permission(target, 1)
+                self.assertFalse(allowed); self.assertIn("checked", note)
+            for status in ("HTTP 404", "HTTP 410"):
+                with mock.patch.object(collector, "read_response", side_effect=collector.CollectionError(status)):
+                    allowed, note = collector.robots_permission(target, 1)
+                    self.assertTrue(allowed); self.assertIn("RFC 9309", note)
+            for status in ("HTTP 403", "HTTP 429", "HTTP 503"):
+                with mock.patch.object(collector, "read_response", side_effect=collector.CollectionError(status)):
+                    allowed, note = collector.robots_permission(target, 1)
+                    self.assertIsNone(allowed); self.assertIn(status, note)
+            with mock.patch.object(collector, "read_response", side_effect=TimeoutError("timed out")):
+                allowed, note = collector.robots_permission(target, 1)
+                self.assertIsNone(allowed); self.assertIn("timed out", note)
+
     def test_crawler_collision_and_size_cap_do_not_overwrite(self) -> None:
         exported = self.work / "export"; exported.mkdir()
         (exported / "one.html").write_text("<html>one</html>")

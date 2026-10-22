@@ -355,7 +355,12 @@ def robots_permission(url: str, timeout: float) -> tuple[bool | None, str]:
         permitted_redirect = ("files.ofsted.gov.uk", "reports.ofsted.gov.uk") if parsed.hostname == "files.ofsted.gov.uk" else None
         final, body, _ = read_response(robots_url, timeout=timeout, max_bytes=512_000,
                                        permitted_cross_host_redirect=permitted_redirect)
-    except CollectionError as exc:
+    except (CollectionError, urllib.error.URLError, TimeoutError) as exc:
+        # RFC 9309 permits access after an unavailable robots resource. Keep this
+        # narrow: 401/403/429 and other 4xx responses remain conservative blocks
+        # for this bounded collector.
+        if isinstance(exc, CollectionError) and str(exc) in {"HTTP 404", "HTTP 410"}:
+            return True, f"robots unavailable ({exc}); no rules found (RFC 9309 2.3.1.3)"
         return None, f"robots unavailable: {exc}"
     parser = urllib.robotparser.RobotFileParser()
     parser.set_url(final); parser.parse(body.decode("utf-8", errors="replace").splitlines())
