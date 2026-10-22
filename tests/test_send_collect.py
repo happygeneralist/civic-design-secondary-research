@@ -59,6 +59,7 @@ class SendCollectTests(unittest.TestCase):
         exported = collector.metadata_export(self.archive)
         self.assertEqual(exported["sources"][0]["sha256"], first_data["sha256"])
         self.assertNotIn("archive_path", exported["sources"][0])
+        self.assertEqual({item["source_key"] for item in exported["sources"][0]["relationships"]}, {"one", "two"})
 
     def test_importer_records_crawler_provenance_and_rejects_path_escape(self) -> None:
         fixture_dir = ROOT / "tests/fixtures"
@@ -80,15 +81,17 @@ class SendCollectTests(unittest.TestCase):
 
     def test_status_reports_latest_outcomes_and_authority_coverage(self) -> None:
         manifest = collector.catalogue(ROOT / "intake/seeds/SEND_all_153_local_authorities.csv", ROOT / "intake/seeds/direct_sources.csv")
-        collector.write_run(self.archive, "fetch", [
-            {"source_key": "a", "status": "downloaded", "host": "files.ofsted.gov.uk", "local_authority": "Essex"},
-            {"source_key": "b", "status": "blocked", "host": "www.lgo.org.uk", "local_authority": "Essex"},
-        ])
+        state = collector.archive_state(self.archive)
+        collector.archive_bytes(self.archive, state, source_key="a", original_url="https://www.gov.uk/report", final_url="https://www.gov.uk/report", body=b"held", content_type="text/html", metadata={"collection_provenance": "test", "local_authority": "Essex", "ons_code": "E10000012"})
+        collector.save_state(self.archive, state)
+        collector.write_run(self.archive, "fetch", [{"source_key": "a", "status": "downloaded", "host": "www.gov.uk", "local_authority": "Essex"}])
+        collector.write_run(self.archive, "fetch", [{"source_key": "a", "status": "skipped", "host": "www.gov.uk", "local_authority": "Essex"}, {"source_key": "b", "status": "blocked", "host": "www.lgo.org.uk", "local_authority": "Essex"}])
         report = collector.status_report(manifest, self.archive)
         self.assertEqual(report["registered"], 469)
-        self.assertEqual(report["outcomes"]["downloaded"], 1)
-        self.assertEqual(report["outcomes"]["blocked"], 1)
-        self.assertEqual(report["authority_coverage"]["covered"], 1)
+        self.assertEqual(report["latest_run_outcomes"]["skipped"], 1)
+        self.assertEqual(report["latest_run_outcomes"]["blocked"], 1)
+        self.assertEqual(report["archive"]["externally_held_sources"], 1)
+        self.assertEqual(report["authority_coverage"]["externally_held"], 1)
 
     def test_existing_repository_source_is_skipped_unless_explicitly_requested(self) -> None:
         manifest = collector.catalogue(ROOT / "intake/seeds/SEND_all_153_local_authorities.csv", ROOT / "intake/seeds/direct_sources.csv")
@@ -97,6 +100,52 @@ class SendCollectTests(unittest.TestCase):
         events, _ = collector.fetch(manifest, self.archive, args)
         self.assertEqual(events[0]["status"], "skipped")
         self.assertEqual(events[0]["reason"], "already held in repository source archive")
+
+    def test_verified_url_import_requires_official_individual_urls_and_merges(self) -> None:
+        batch = self.work / "urls.csv"
+        with batch.open("w", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=["url", "title", "source_class", "publisher", "local_authority", "ons_code", "source_verification", "rights_check", "discovery_parent_url", "collection_id"])
+            writer.writeheader()
+            writer.writerow({"url": "https://www.lgo.org.uk/decisions/education/special-educational-needs/25-014-149", "title": "Surrey decision", "source_class": "direct_html", "publisher": "LGSCO", "local_authority": "Surrey", "ons_code": "E10000030", "source_verification": "official_category_verified", "rights_check": "checked", "discovery_parent_url": "https://www.lgo.org.uk/decisions/education/special-educational-needs", "collection_id": "test"})
+            writer.writerow({"url": "https://www.lgo.org.uk/decisions/education/special-educational-needs/25-014-149", "title": "Surrey decision duplicate provenance", "source_class": "direct_html", "publisher": "LGSCO", "local_authority": "Surrey", "ons_code": "E10000030", "source_verification": "official_category_verified", "rights_check": "checked", "discovery_parent_url": "https://www.lgo.org.uk/decisions/education/special-educational-needs", "collection_id": "test-2"})
+        records = collector.verified_url_records(batch)
+        manifest = collector.merge_manifest(collector.catalogue(ROOT / "intake/seeds/SEND_all_153_local_authorities.csv", ROOT / "intake/seeds/direct_sources.csv"), records)
+        self.assertEqual(manifest["counts"]["imported_url_records"], 1)
+        self.assertEqual(manifest["counts"]["merged_url_records"], 1)
+        self.assertEqual(manifest["counts"]["total_records"], 470)
+        bad = self.work / "bad-urls.csv"
+        bad.write_text("url,title,source_class,source_verification,rights_check\nhttps://example.org/search/all,No,direct_html,verified_direct,checked\n")
+        with self.assertRaises(collector.CollectionError):
+            collector.verified_url_records(bad)
+
+    def test_untrusted_hosts_and_archive_inside_checkout_are_rejected(self) -> None:
+        with self.assertRaises(collector.CollectionError):
+            collector.assert_safe_url("https://example.org/report", collector.TRUSTED_FETCH_HOSTS)
+        with self.assertRaises(collector.CollectionError):
+            collector.external_archive_root(ROOT / "intake/run-output/archive", ROOT)
+
+    def test_response_quality_checks_pdf_html_and_block_pages(self) -> None:
+        with self.assertRaises(collector.CollectionError):
+            collector.validate_response({"source_class": "direct_pdf"}, b"<html>blocked</html>", "text/html")
+        with self.assertRaises(collector.CollectionError):
+            collector.validate_response({"source_class": "direct_html"}, b"<html><title>Access denied</title></html>", "text/html")
+        collector.validate_response({"source_class": "direct_pdf"}, b"%PDF-1.7 report", "application/pdf")
+        collector.validate_response({"source_class": "direct_html"}, b"<!doctype html><html><body>report</body></html>", "text/html")
+
+    def test_crawler_collision_and_size_cap_do_not_overwrite(self) -> None:
+        exported = self.work / "export"; exported.mkdir()
+        (exported / "one.html").write_text("<html>one</html>")
+        csv_path = exported / "crawl.csv"
+        csv_path.write_text("url,content_path,collection_id\nhttps://example.org/a,one.html,batch\n")
+        first, _ = collector.import_crawl_export(csv_path, self.archive)
+        second, _ = collector.import_crawl_export(csv_path, self.archive)
+        self.assertEqual(first[0]["status"], "downloaded")
+        self.assertEqual(second[0]["status"], "skipped")
+        (exported / "one.html").write_text("<html>changed</html>")
+        changed, _ = collector.import_crawl_export(csv_path, self.archive)
+        self.assertEqual(changed[0]["status"], "blocked")
+        capped, _ = collector.import_crawl_export(csv_path, self.work / "small", max_bytes=5)
+        self.assertEqual(capped[0]["status"], "failed")
 
 
 if __name__ == "__main__":

@@ -11,8 +11,7 @@ import csv
 import hashlib
 import ipaddress
 import json
-import mimetypes
-import os
+import re
 import socket
 import sys
 import time
@@ -20,13 +19,16 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import urllib.robotparser
-from collections import Counter, defaultdict
+from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
-VERSION = "0.1.0"
-DIRECT_CLASSES = {"direct_pdf", "direct_html"}
+VERSION = "0.2.0"
+DIRECT_CLASSES = {"direct_pdf", "direct_html", "direct_data"}
+# reports.ofsted.gov.uk is included solely because files.ofsted.gov.uk redirects
+# its robots policy there; document redirects remain same-host only.
+TRUSTED_FETCH_HOSTS = frozenset({"files.ofsted.gov.uk", "reports.ofsted.gov.uk", "www.gov.uk", "www.lgo.org.uk"})
 USER_AGENT = "CivicDesignSENDCollector/0.1 (+research source acquisition; contact repository owner)"
 PRIVATE_NETWORKS = (
     ipaddress.ip_network("127.0.0.0/8"), ipaddress.ip_network("10.0.0.0/8"),
@@ -80,11 +82,13 @@ def is_public_address(address: str) -> bool:
                 any(candidate in network for network in PRIVATE_NETWORKS))
 
 
-def assert_safe_url(url: str) -> str:
+def assert_safe_url(url: str, allowed_hosts: frozenset[str] | None = None) -> str:
     normalized = canonical_url(url)
     host = host_for(normalized)
     if host == "localhost" or host.endswith(".localhost"):
         raise CollectionError("localhost URLs are not allowed")
+    if allowed_hosts is not None and host not in allowed_hosts:
+        raise CollectionError(f"host {host} is not approved for this bounded collection")
     try:
         addresses = {entry[4][0] for entry in socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)}
     except socket.gaierror as exc:
@@ -106,6 +110,90 @@ def extension_for(content_type: str, url: str) -> str:
 def load_csv(path: Path) -> list[dict[str, str]]:
     with path.open(newline="", encoding="utf-8-sig") as handle:
         return list(csv.DictReader(handle))
+
+
+def external_archive_root(root: Path, repository_root: Path) -> Path:
+    """Reject archive locations that could put raw source material into Git."""
+    archive = root.expanduser().resolve()
+    repository = repository_root.expanduser().resolve()
+    if archive == repository or repository in archive.parents:
+        raise CollectionError("archive-root must be outside the Git checkout")
+    return archive
+
+
+def stable_source_key(prefix: str, url: str) -> str:
+    return f"{prefix}-{hashlib.sha256(canonical_url(url).encode()).hexdigest()[:16]}"
+
+
+def is_discovery_url(url: str) -> bool:
+    path = urllib.parse.urlsplit(canonical_url(url)).path.lower().rstrip("/")
+    return path.endswith("/special-educational-needs") or "/search" in path or "/collections/" in path
+
+
+def verified_url_records(path: Path) -> list[dict[str, Any]]:
+    """Load bounded individual document candidates without changing supplied seeds."""
+    records: list[dict[str, Any]] = []
+    for row_number, row in enumerate(load_csv(path), start=2):
+        try:
+            for field in ("url", "title", "source_class", "source_verification", "rights_check"):
+                if not (row.get(field) or "").strip():
+                    raise CollectionError(f"{field} is required")
+            url = assert_safe_url(row["url"], TRUSTED_FETCH_HOSTS)
+            if row["source_class"] not in DIRECT_CLASSES:
+                raise CollectionError("source_class must be direct_pdf, direct_html, or direct_data")
+            if is_discovery_url(url):
+                raise CollectionError("directories, category pages, collections, and searches are not individual document URLs")
+            verification = row["source_verification"].strip()
+            if not (verification.startswith("verified_") or verification.startswith("official_")):
+                raise CollectionError("source_verification must record an official or verified direct URL check")
+            parent = (row.get("discovery_parent_url") or "").strip()
+            source_key = (row.get("source_key") or "").strip() or stable_source_key("import", url)
+            if not re.fullmatch(r"[a-z0-9][a-z0-9-]{2,100}", source_key):
+                raise CollectionError("source_key must use lower-case letters, numbers, and hyphens")
+            records.append({
+                "source_key": source_key, "title": row["title"].strip(), "record_kind": "document_candidate",
+                "source_class": row["source_class"].strip(), "discovery_url": None, "document_url": url,
+                "publisher": (row.get("publisher") or "").strip() or None,
+                "local_authority": (row.get("local_authority") or "").strip() or None,
+                "ons_code": (row.get("ons_code") or "").strip() or None,
+                "source_verification": verification, "retrieval_status": "not_attempted",
+                "rights_check": row["rights_check"].strip(),
+                "discovery_parent_url": canonical_url(parent) if parent else None,
+                "collection_id": (row.get("collection_id") or "").strip() or None,
+                "seed_provenance": path.name, "import_provenance": [{"input": path.name, "row": row_number}],
+                "repository_archive_ref": None, "notes": (row.get("notes") or "").strip(),
+            })
+        except CollectionError as exc:
+            raise CollectionError(f"{path}:{row_number}: {exc}") from exc
+    if not records:
+        raise CollectionError(f"{path}: no URL records supplied")
+    return records
+
+
+def merge_manifest(manifest: dict[str, Any], imported: list[dict[str, Any]]) -> dict[str, Any]:
+    """Merge candidates by document URL, keeping all source-list provenance."""
+    result = {**manifest, "records": [dict(record) for record in manifest["records"]], "counts": dict(manifest["counts"])}
+    by_url = {record.get("document_url"): record for record in result["records"] if record.get("document_url")}
+    keys = {record["source_key"]: record for record in result["records"]}
+    added = merged = 0
+    for record in imported:
+        existing = by_url.get(record["document_url"])
+        if existing:
+            existing.setdefault("import_provenance", []).extend(record["import_provenance"])
+            existing.setdefault("discovery_parent_urls", [])
+            if record.get("discovery_parent_url") and record["discovery_parent_url"] not in existing["discovery_parent_urls"]:
+                existing["discovery_parent_urls"].append(record["discovery_parent_url"])
+            existing.setdefault("collection_ids", [])
+            if record.get("collection_id") and record["collection_id"] not in existing["collection_ids"]:
+                existing["collection_ids"].append(record["collection_id"])
+            merged += 1
+            continue
+        if record["source_key"] in keys:
+            raise CollectionError(f"source_key {record['source_key']} already refers to a different URL")
+        result["records"].append(record); by_url[record["document_url"]] = record; keys[record["source_key"]] = record; added += 1
+    result["counts"].update(total_records=len(result["records"]), imported_url_records=added, merged_url_records=merged)
+    result["created_at"] = now()
+    return result
 
 
 def catalogue(authorities_path: Path, direct_path: Path) -> dict[str, Any]:
@@ -171,8 +259,22 @@ def save_state(root: Path, state: dict[str, Any]) -> None:
 def archive_bytes(root: Path, state: dict[str, Any], *, source_key: str, original_url: str,
                   final_url: str, body: bytes, content_type: str, metadata: dict[str, Any]) -> tuple[str, dict[str, Any]]:
     digest = hashlib.sha256(body).hexdigest()
+    relationship = {"source_key": source_key, "original_url": canonical_url(original_url), "final_url": canonical_url(final_url),
+                    "collected_at": now(), "collection_provenance": metadata.get("collection_provenance"),
+                    "discovery_parent_url": metadata.get("discovery_parent_url"), "collection_id": metadata.get("collection_id"),
+                    "crawler_metadata": metadata.get("crawler_metadata")}
+    relationship = {key: value for key, value in relationship.items() if value is not None}
     existing = state["hashes"].get(digest)
     if existing:
+        metadata_path = root / "objects" / digest / "metadata.json"
+        try:
+            object_metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            object_metadata = {"sha256": digest, "archive_path": existing["archive_path"]}
+        relationships = object_metadata.setdefault("relationships", [])
+        if not any(item.get("source_key") == source_key and item.get("original_url") == relationship["original_url"] for item in relationships):
+            relationships.append(relationship)
+            json_dump(metadata_path, object_metadata)
         entry = {"status": "duplicate", "sha256": digest, "archive_path": existing["archive_path"], "duplicate_of": existing.get("source_key")}
     else:
         object_dir = root / "objects" / digest
@@ -182,11 +284,14 @@ def archive_bytes(root: Path, state: dict[str, Any], *, source_key: str, origina
             archive_path.write_bytes(body)
         relative = archive_path.relative_to(root).as_posix()
         object_metadata = {"sha256": digest, "bytes": len(body), "archive_path": relative, "first_source_key": source_key,
-                           "original_url": original_url, "final_url": final_url, "content_type": content_type, "retrieved_at": now(), **metadata}
+                           "original_url": original_url, "final_url": final_url, "content_type": content_type, "retrieved_at": now(), "relationships": [relationship], **metadata}
         json_dump(object_dir / "metadata.json", object_metadata)
         state["hashes"][digest] = {"archive_path": relative, "source_key": source_key}
         entry = {"status": "downloaded", "sha256": digest, "archive_path": relative}
-    state["sources"][source_key] = {"sha256": digest, "archive_path": entry["archive_path"], "stored_at": now()}
+    state["sources"][source_key] = {"sha256": digest, "archive_path": entry["archive_path"], "stored_at": now(),
+                                     "original_url": canonical_url(original_url), "final_url": canonical_url(final_url),
+                                     "local_authority": metadata.get("local_authority"), "ons_code": metadata.get("ons_code"),
+                                     "source_class": metadata.get("source_class"), "collection_provenance": metadata.get("collection_provenance")}
     state["url_aliases"][canonical_url(original_url)] = canonical_url(final_url)
     return entry["status"], entry
 
@@ -196,9 +301,11 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
-def read_response(url: str, *, timeout: float, max_bytes: int) -> tuple[str, bytes, str]:
-    opener = urllib.request.build_opener(NoRedirect())
-    current = assert_safe_url(url)
+def read_response(url: str, *, timeout: float, max_bytes: int, allow_cross_host: bool = False) -> tuple[str, bytes, str]:
+    # Deliberately ignore environment proxy settings: untrusted URL lists must not
+    # turn this process into a request through an arbitrary proxy.
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
+    current = assert_safe_url(url, TRUSTED_FETCH_HOSTS)
     original = urllib.parse.urlsplit(current)
     for _ in range(6):
         request = urllib.request.Request(current, headers={"User-Agent": USER_AGENT, "Accept": "application/pdf,text/html,application/xhtml+xml,text/plain;q=0.9,*/*;q=0.1"})
@@ -211,9 +318,10 @@ def read_response(url: str, *, timeout: float, max_bytes: int) -> tuple[str, byt
             location = response.headers.get("Location")
             if not location:
                 raise CollectionError("redirect without Location")
-            current = assert_safe_url(urllib.parse.urljoin(current, location))
+            current = assert_safe_url(urllib.parse.urljoin(current, location), TRUSTED_FETCH_HOSTS)
             redirected = urllib.parse.urlsplit(current)
-            if redirected.hostname != original.hostname or (original.scheme == "https" and redirected.scheme != "https"):
+            if ((redirected.hostname != original.hostname and not allow_cross_host) or
+                    (original.scheme == "https" and redirected.scheme != "https")):
                 raise CollectionError("cross-host or HTTPS-to-HTTP redirect blocked; resolve and verify it as a separate source")
             continue
         if status != 200:
@@ -232,16 +340,34 @@ def read_response(url: str, *, timeout: float, max_bytes: int) -> tuple[str, byt
 
 
 def robots_permission(url: str, timeout: float) -> tuple[bool | None, str]:
-    safe = assert_safe_url(url)
+    safe = assert_safe_url(url, TRUSTED_FETCH_HOSTS)
     parsed = urllib.parse.urlsplit(safe)
     robots_url = f"{parsed.scheme}://{parsed.netloc}/robots.txt"
     try:
-        final, body, _ = read_response(robots_url, timeout=timeout, max_bytes=512_000)
+        # A host may centralise robots.txt on another explicitly approved official
+        # host. This exception applies only to robots policy retrieval, never source
+        # document acquisition.
+        final, body, _ = read_response(robots_url, timeout=timeout, max_bytes=512_000, allow_cross_host=True)
     except CollectionError as exc:
         return None, f"robots unavailable: {exc}"
     parser = urllib.robotparser.RobotFileParser()
     parser.set_url(final); parser.parse(body.decode("utf-8", errors="replace").splitlines())
     return parser.can_fetch(USER_AGENT, safe), f"checked {final}"
+
+
+def validate_response(record: dict[str, Any], body: bytes, content_type: str) -> None:
+    """Reject an error/block page that merely has a successful HTTP status."""
+    kind = record["source_class"]
+    actual_type = content_type.split(";", 1)[0].lower()
+    if kind == "direct_pdf":
+        if actual_type != "application/pdf" or not body.startswith(b"%PDF-"):
+            raise CollectionError("expected a PDF response with an application/pdf content type and PDF signature")
+    elif kind == "direct_html":
+        snippet = body[:8192].decode("utf-8", errors="ignore").lower()
+        if actual_type not in {"text/html", "application/xhtml+xml"} or "<html" not in snippet:
+            raise CollectionError("expected an HTML document response")
+        if any(marker in snippet for marker in ("access denied", "captcha", "robot check", "request blocked", "error 403")):
+            raise CollectionError("HTML response appears to be an access/error page")
 
 
 def run_path(root: Path, command: str) -> Path:
@@ -260,8 +386,8 @@ def write_run(root: Path, command: str, events: list[dict[str, Any]], extra: dic
     return target
 
 
-def select_fetch_records(manifest: dict[str, Any], limit: int | None, keys: set[str]) -> list[dict[str, Any]]:
-    selected = [record for record in manifest["records"] if record["source_class"] in DIRECT_CLASSES and (not keys or record["source_key"] in keys)]
+def select_fetch_records(manifest: dict[str, Any], limit: int | None, keys: set[str], collection_id: str | None = None) -> list[dict[str, Any]]:
+    selected = [record for record in manifest["records"] if record["source_class"] in DIRECT_CLASSES and (not keys or record["source_key"] in keys) and (not collection_id or record.get("collection_id") == collection_id or collection_id in record.get("collection_ids", []))]
     return selected[:limit] if limit is not None else selected
 
 
@@ -270,7 +396,7 @@ def fetch(manifest: dict[str, Any], root: Path, args: argparse.Namespace) -> tup
     state = archive_state(root)
     events: list[dict[str, Any]] = []
     terms_hosts = {value.lower() for value in args.accept_terms}
-    for record in select_fetch_records(manifest, args.limit, set(args.source_key)):
+    for record in select_fetch_records(manifest, args.limit, set(args.source_key), getattr(args, "collection_id", None)):
         url = record["document_url"]
         event: dict[str, Any] = {"source_key": record["source_key"], "source_class": record["source_class"], "original_url": url,
                                  "host": host_for(url), "local_authority": record["local_authority"], "at": now()}
@@ -290,8 +416,9 @@ def fetch(manifest: dict[str, Any], root: Path, args: argparse.Namespace) -> tup
             for attempt in range(args.retries + 1):
                 try:
                     final_url, body, content_type = read_response(url, timeout=args.timeout, max_bytes=args.max_bytes)
+                    validate_response(record, body, content_type)
                     status, stored = archive_bytes(root, state, source_key=record["source_key"], original_url=url, final_url=final_url,
-                                                   body=body, content_type=content_type, metadata={"collection_provenance": "direct seed", "publisher": record["publisher"], "local_authority": record["local_authority"], "ons_code": record["ons_code"], "source_verification": record["source_verification"], "robots": robots_note})
+                                                   body=body, content_type=content_type, metadata={"collection_provenance": record.get("seed_provenance", "direct seed"), "publisher": record["publisher"], "local_authority": record["local_authority"], "ons_code": record["ons_code"], "source_class": record["source_class"], "source_verification": record["source_verification"], "rights_check": record.get("rights_check"), "discovery_parent_url": record.get("discovery_parent_url"), "collection_id": record.get("collection_id"), "robots": robots_note})
                     stored.pop("status", None)
                     event.update(status=status, final_url=final_url, content_type=content_type, bytes=len(body), **stored); last_error = None; break
                 except (CollectionError, urllib.error.URLError, TimeoutError) as exc:
@@ -301,7 +428,7 @@ def fetch(manifest: dict[str, Any], root: Path, args: argparse.Namespace) -> tup
             if last_error is not None:
                 event.update(status="failed", reason=str(last_error))
         except (CollectionError, urllib.error.URLError, TimeoutError) as exc:
-            event.update(status="blocked" if "non-public" in str(exc) or "not allowed" in str(exc) else "failed", reason=str(exc))
+            event.update(status="blocked" if "non-public" in str(exc) or "not allowed" in str(exc) or "not approved" in str(exc) else "failed", reason=str(exc))
         events.append(event)
         if args.rate_limit > 0:
             time.sleep(args.rate_limit)
@@ -309,14 +436,16 @@ def fetch(manifest: dict[str, Any], root: Path, args: argparse.Namespace) -> tup
     return events, write_run(root, "fetch", events, {"execute": args.execute, "manifest_records": len(manifest["records"])})
 
 
-def import_crawl_export(path: Path, root: Path) -> tuple[list[dict[str, Any]], Path]:
+def import_crawl_export(path: Path, root: Path, max_bytes: int = 25 * 1024 * 1024) -> tuple[list[dict[str, Any]], Path]:
     root.mkdir(parents=True, exist_ok=True)
     state = archive_state(root); events: list[dict[str, Any]] = []
     with path.open(newline="", encoding="utf-8-sig") as handle:
         for number, row in enumerate(csv.DictReader(handle), start=2):
-            event: dict[str, Any] = {"row": number, "at": now(), "import_file": str(path), "source_key": f"crawl-{path.stem}-{number}"}
+            event: dict[str, Any] = {"row": number, "at": now(), "import_file": str(path)}
             try:
                 url = canonical_url(row.get("url", "")); event["original_url"] = url; event["host"] = host_for(url)
+                collection_id = (row.get("collection_id") or path.stem).strip()
+                event["source_key"] = (row.get("source_key") or "").strip() or f"crawl-{re.sub(r'[^a-z0-9]+', '-', collection_id.lower()).strip('-')}-{hashlib.sha256(url.encode()).hexdigest()[:12]}"
                 content: bytes
                 content_path = (row.get("content_path") or "").strip()
                 if content_path:
@@ -325,6 +454,8 @@ def import_crawl_export(path: Path, root: Path) -> tuple[list[dict[str, Any]], P
                         raise CollectionError("content_path must stay within the export directory")
                     if not supplied.is_file():
                         raise CollectionError("content_path does not name a file")
+                    if supplied.stat().st_size > max_bytes:
+                        raise CollectionError(f"crawler capture exceeds {max_bytes} byte size cap")
                     content = supplied.read_bytes(); supplied_kind = "content_path"
                 elif row.get("html") is not None and row.get("html", "") != "":
                     content = row["html"].encode("utf-8"); supplied_kind = "html"
@@ -334,9 +465,17 @@ def import_crawl_export(path: Path, root: Path) -> tuple[list[dict[str, Any]], P
                     raise CollectionError("one of content_path, html, or text is required")
                 if not content:
                     raise CollectionError("crawler capture is empty")
+                if len(content) > max_bytes:
+                    raise CollectionError(f"crawler capture exceeds {max_bytes} byte size cap")
+                digest = hashlib.sha256(content).hexdigest()
+                existing_source = state["sources"].get(event["source_key"])
+                if existing_source:
+                    if existing_source.get("sha256") == digest:
+                        event.update(status="skipped", reason="crawler source_key already archived", **existing_source); events.append(event); continue
+                    event.update(status="blocked", reason="crawler source_key collision has different content; use a reviewed new source_key"); events.append(event); continue
                 content_type = "text/html" if supplied_kind == "html" or content_path.endswith((".html", ".htm")) else "text/plain"
                 status, stored = archive_bytes(root, state, source_key=event["source_key"], original_url=url, final_url=url, body=content, content_type=content_type,
-                                               metadata={"collection_provenance": "external_site_scraper_export", "crawler_metadata": {k: row.get(k) for k in ("title", "captured_at", "collection_id", "content_path")}, "acquisition_note": "content supplied by external crawler; not independently retrieved or verified"})
+                                               metadata={"collection_provenance": "external_site_scraper_export", "source_class": "crawler_capture", "collection_id": collection_id, "crawler_metadata": {k: row.get(k) for k in ("title", "captured_at", "collection_id", "content_path")}, "acquisition_note": "content supplied by external crawler; not independently retrieved or verified"})
                 stored.pop("status", None)
                 event.update(status=status, bytes=len(content), **stored)
             except (CollectionError, OSError) as exc:
@@ -356,18 +495,30 @@ def events_from_runs(root: Path) -> Iterable[dict[str, Any]]:
 
 def status_report(manifest: dict[str, Any], root: Path) -> dict[str, Any]:
     events = list(events_from_runs(root))
-    latest: dict[str, dict[str, Any]] = {}
-    for event in events:
-        latest[event.get("source_key", f"row-{len(latest)}")] = event
-    outcomes = Counter(event.get("status", "unknown") for event in latest.values())
+    # File names can share a UTC-second prefix; use write time rather than the
+    # collision suffix to identify the actual latest run.
+    run_files = sorted((root / "runs").glob("*.json"), key=lambda path: path.stat().st_mtime_ns)
+    latest_events: list[dict[str, Any]] = []
+    if run_files:
+        try:
+            latest_events = json.loads(run_files[-1].read_text(encoding="utf-8")).get("events", [])
+        except (OSError, json.JSONDecodeError):
+            pass
+    state = archive_state(root)
+    historical_outcomes = Counter(event.get("status", "unknown") for event in events)
+    latest_outcomes = Counter(event.get("status", "unknown") for event in latest_events)
     source_classes = Counter(record["source_class"] for record in manifest["records"])
     authorities = {record["ons_code"] for record in manifest["records"] if record.get("ons_code")}
-    covered = {event.get("local_authority") for event in latest.values() if event.get("status") in {"downloaded", "duplicate", "skipped"} and event.get("local_authority")}
-    hosts = Counter(event.get("host", "unknown") for event in latest.values())
+    held = list(state["sources"].values())
+    covered = {entry.get("local_authority") for entry in held if entry.get("local_authority")}
+    hosts = Counter(host_for(entry["original_url"]) for entry in held if entry.get("original_url"))
     return {"registered": len(manifest["records"]), "authority_rows": manifest["counts"]["authority_rows"], "discovery_records": manifest["counts"]["discovery_records"],
-            "document_candidates": sum(1 for r in manifest["records"] if r["record_kind"] == "document_candidate"), "outcomes": dict(sorted(outcomes.items())),
-            "authority_coverage": {"covered": len(covered), "known": len(authorities), "names": sorted(covered)}, "hosts": dict(hosts), "source_classes": dict(source_classes),
-            "caveats": ["Discovery links are constructed/unverified entry points, not reports.", "Successful acquisition records provenance only; it does not validate, review or interpret a source.", "Crawler-supplied captures remain distinct from independently downloaded originals.", "Terms, robots and reuse conditions must be checked for every collection host."]}
+            "document_candidates": sum(1 for r in manifest["records"] if r["record_kind"] == "document_candidate"),
+            "archive": {"externally_held_sources": len(held), "unique_content_objects": len(state["hashes"])},
+            "latest_run_outcomes": dict(sorted(latest_outcomes.items())), "historical_event_outcomes": dict(sorted(historical_outcomes.items())),
+            "outcomes": dict(sorted(latest_outcomes.items())),
+            "authority_coverage": {"externally_held": len(covered), "known": len(authorities), "names": sorted(covered)}, "hosts": dict(hosts), "source_classes": dict(source_classes),
+            "caveats": ["Discovery links are constructed/unverified entry points, not reports.", "Externally held counts come from archive state; latest-run skips never overwrite durable holdings.", "A source already held in this Git repository is not counted as externally archived.", "Successful acquisition records provenance only; it does not validate, review or interpret a source.", "Crawler-supplied captures remain distinct from independently downloaded originals.", "Terms, robots and reuse conditions must be checked for every collection host."]}
 
 
 def metadata_export(root: Path) -> dict[str, Any]:
@@ -375,7 +526,7 @@ def metadata_export(root: Path) -> dict[str, Any]:
     entries: list[dict[str, Any]] = []
     permitted = {"sha256", "bytes", "first_source_key", "original_url", "final_url", "content_type", "retrieved_at",
                  "collection_provenance", "publisher", "local_authority", "ons_code", "source_verification", "robots",
-                 "acquisition_note", "crawler_metadata"}
+                 "acquisition_note", "crawler_metadata", "rights_check", "relationships"}
     for path in sorted((root / "objects").glob("*/metadata.json")):
         try:
             metadata = json.loads(path.read_text(encoding="utf-8"))
@@ -409,11 +560,16 @@ def main(argv: list[str] | None = None) -> int:
     sub = parser.add_subparsers(dest="command", required=True)
     catalogue_parser = sub.add_parser("catalogue", help="create a normalized source/discovery manifest")
     catalogue_parser.add_argument("--output", required=True, type=Path)
+    urls_parser = sub.add_parser("import-urls", help="merge verified individual official URLs into a new manifest")
+    urls_parser.add_argument("--input", required=True, type=Path)
+    urls_parser.add_argument("--manifest", type=Path, help="existing manifest; defaults to supplied seed catalogue")
+    urls_parser.add_argument("--output", required=True, type=Path)
     fetch_parser = sub.add_parser("fetch", help="fetch direct document candidates only; dry-run by default")
     fetch_parser.add_argument("--manifest", type=Path)
     fetch_parser.add_argument("--archive-root", required=True, type=Path)
     fetch_parser.add_argument("--execute", action="store_true", help="explicitly permit network retrieval")
     fetch_parser.add_argument("--source-key", action="append", default=[])
+    fetch_parser.add_argument("--collection-id", help="only fetch verified imported candidates from this named batch")
     fetch_parser.add_argument("--include-known-source", action="store_true", help="allow retrieval of a direct seed already archived in this repository")
     fetch_parser.add_argument("--limit", type=int)
     fetch_parser.add_argument("--accept-terms", action="append", default=[], metavar="HOST", help="host whose terms/reuse rules you have checked")
@@ -425,6 +581,7 @@ def main(argv: list[str] | None = None) -> int:
     import_parser = sub.add_parser("import-crawl-export", help="archive a local external-scraper CSV export")
     import_parser.add_argument("--input", required=True, type=Path)
     import_parser.add_argument("--archive-root", required=True, type=Path)
+    import_parser.add_argument("--max-bytes", type=int, default=25 * 1024 * 1024)
     status_parser = sub.add_parser("status", help="summarise manifest and archive run results")
     status_parser.add_argument("--manifest", type=Path)
     status_parser.add_argument("--archive-root", required=True, type=Path)
@@ -438,21 +595,29 @@ def main(argv: list[str] | None = None) -> int:
             authority, direct = default_paths(args.repo_root)
             value = catalogue(authority, direct); json_dump(args.output, value)
             print(f"catalogued {value['counts']['authority_rows']} authorities, {value['counts']['discovery_records']} discovery records, {value['counts']['direct_seed_records']} direct seed records: {args.output}")
+        elif args.command == "import-urls":
+            value = merge_manifest(load_manifest_or_catalogue(args), verified_url_records(args.input)); json_dump(args.output, value)
+            print(f"imported {value['counts']['imported_url_records']} verified individual URLs; merged {value['counts']['merged_url_records']}: {args.output}")
         elif args.command == "fetch":
-            manifest = load_manifest_or_catalogue(args); events, run = fetch(manifest, args.archive_root, args); print_summary("fetch", events, run)
+            archive = external_archive_root(args.archive_root, args.repo_root)
+            manifest = load_manifest_or_catalogue(args); events, run = fetch(manifest, archive, args); print_summary("fetch", events, run)
         elif args.command == "import-crawl-export":
-            events, run = import_crawl_export(args.input, args.archive_root); print_summary("import-crawl-export", events, run)
+            archive = external_archive_root(args.archive_root, args.repo_root)
+            events, run = import_crawl_export(args.input, archive, args.max_bytes); print_summary("import-crawl-export", events, run)
         elif args.command == "status":
-            report = status_report(load_manifest_or_catalogue(args), args.archive_root)
+            archive = external_archive_root(args.archive_root, args.repo_root)
+            report = status_report(load_manifest_or_catalogue(args), archive)
             if args.json: print(json.dumps(report, indent=2, sort_keys=True))
             else:
                 print(f"registered={report['registered']} discovery={report['discovery_records']} document_candidates={report['document_candidates']}")
                 print("outcomes=" + ", ".join(f"{key}={value}" for key, value in report["outcomes"].items()))
-                print(f"authority_coverage={report['authority_coverage']['covered']}/{report['authority_coverage']['known']}")
+                print(f"externally_held={report['archive']['externally_held_sources']} unique_objects={report['archive']['unique_content_objects']}")
+                print(f"authority_coverage={report['authority_coverage']['externally_held']}/{report['authority_coverage']['known']}")
                 print("hosts=" + ", ".join(f"{key}={value}" for key, value in report["hosts"].items()))
                 print("Caveats:"); [print(f"- {caveat}") for caveat in report["caveats"]]
         elif args.command == "export-metadata":
-            export = metadata_export(args.archive_root); json_dump(args.output, export)
+            archive = external_archive_root(args.archive_root, args.repo_root)
+            export = metadata_export(archive); json_dump(args.output, export)
             print(f"exported {len(export['sources'])} metadata-only source records: {args.output}")
     except (CollectionError, OSError, json.JSONDecodeError) as exc:
         print(f"error: {exc}", file=sys.stderr); return 2
