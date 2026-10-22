@@ -144,15 +144,29 @@ python3 scripts/send_collect.py verify-archive \
 
 ## Continuation result: 22 October 2026
 
-The continuation rechecked Ofsted’s [terms of use](https://reports.ofsted.gov.uk/terms-and-conditions) and [copyright notice](https://reports.ofsted.gov.uk/copyright). The site states that most content is Crown copyright under the Open Government Licence, subject to stated exceptions; the operator must still follow the terms and avoid logo reuse. The collector’s current robots check allowed both the `reports.ofsted.gov.uk` provider pages and the `files.ofsted.gov.uk` report URLs (the latter policy resolves through the permitted Ofsted robots redirect).
+The continuation checked Ofsted’s [terms of use](https://reports.ofsted.gov.uk/terms-and-conditions) and [copyright notice](https://reports.ofsted.gov.uk/copyright) before retrieval. The site says most content is Crown copyright under the Open Government Licence, subject to stated exceptions. It also requires lawful, non-disruptive use and says its terms may change, so check again for every future run. The collector checked robots access for each provider-page request and each PDF retrieval; it did not bypass an access control or a robots restriction.
 
-The originally reviewed five provider pages were re-run at one request per second: 15 labelled SEND reports were found and 10 URLs remained novel after reconciliation with the official manifest. The requested acquisition was **not started**: the stated durable external archive could not be located on the available workstation paths or on Marcel, while the discovered `/private/tmp` archives were empty test artefacts. Therefore the truthful result is **downloaded 0, resumed/skipped 0, blocked 0, failed 0, not-attempted 10**. No archive-integrity claim can be made for an unavailable archive, and the historic “16 externally held” count has not been re-verified in this continuation.
+The ten reviewed direct PDFs from the original five provider pages were dry-run and then acquired at one request per second into the durable archive outside Git. Result: **downloaded 10, resumed/skipped 0, duplicate 0, blocked 0, failed 0**. `verify-archive` immediately afterwards found **29 objects, 29 valid, 0 failed and 0 orphaned source references**.
 
-The verified provider mapping now has 25 authorities (the original five plus 20 additions) with exact ONS-code reconciliation against the 153-authority seed. A bounded 25-page pass found 57 labelled SEND reports, 50 URLs novel to the current official manifest, and no provider page without a matching SEND report. This is discovery coverage only: it does not establish that the other 128 authorities lack reports, and it adds no CDI object or evidence claim.
+The verified provider mapping now has 25 authorities (the original five plus 20 additions) with exact ONS-code reconciliation against the 153-authority seed. A bounded one-request-per-second pass visited all 25 official provider pages, found **57** labelled SEND reports and yielded **40** novel direct-PDF candidates after reconciliation with the reviewed ten, the maintained manifest and the durable archive. No mapped provider page lacked a matching SEND report. The 40 review candidates cover 20 newly mapped authorities: 24 local-area SEND inspections, 14 area SEND full inspections and two monitoring inspections.
 
-PDF/source-context spot checks found that the provider-page first inspection date can match a multi-day inspection, but a PDF’s letter date is not its publication date. For example, Essex `50141698` says the inspection ran from 30 September to 4 October 2019; Surrey `50076796` is explicitly a joint local-area **revisit** from 18 to 21 March 2019; Hertfordshire `50292409` gives 20 to 22 October 2025; and Barnsley `50302264` gives 2 to 6 February 2026. The provider-page labels/publication dates remain the source context, and raw labels are retained. Do not promote these fields to evidence without document-level review.
+After reviewing those candidates, a five-authority subset (Barking and Dagenham, Barnet, Barnsley, Bath and North East Somerset, and Bedford) was dry-run and acquired at one request per second. Result: **downloaded 5, resumed/skipped 0, duplicate 0, blocked 0, failed 0**. The second integrity check found **34 objects, 34 valid, 0 failed and 0 orphaned source references**. The durable archive now covers 21 of 153 authorities; the combined review manifest has 71 direct-document candidates covering 35 authorities. These are acquisition and discovery coverage figures only, not claims about the absence of reports in the remaining authorities.
 
-To resume safely once the archive path is supplied, first dry-run the ten previously reviewed URLs against that same root, verify the archive as above, then run a small `--source-key` subset at the existing two-second rate. Record the resulting run manifest, SHA-256 values, and downloaded/resumed/blocked/failed counts before expanding further.
+Five source-context spot checks distinguish provider-page publication dates from document inspection dates: Barking and Dagenham was inspected 27–31 March 2017 and published 29 June 2017; Barnet 17–21 January 2022 and 24 March 2022; Barnsley 2–6 February 2026 and 18 May 2026; Bath and North East Somerset 15–19 June 2026 and 2 September 2026; Bedford 18–22 November 2024 and 4 February 2025. The raw Ofsted labels and provider-page publication dates are retained as provenance; the downloaded PDFs were used only to spot-check date context. Do not promote either field to CDI evidence without document-level human review.
+
+To continue the expanded provider batch, use the verified mapping seed, then review the generated CSV before importing it. Keep the discovery-run root outside Git; the command writes a `runs/` subdirectory below it:
+
+```bash
+python3 scripts/send_collect.py discover-ofsted \
+  --input intake/seeds/ofsted_provider_archives_verified_2026-10-22.csv \
+  --manifest intake/run-output/discovered-ofsted-manifest.json \
+  --archive-root /durable/external/send-archive \
+  --output intake/run-output/ofsted-provider-expansion-review.csv \
+  --run-root /durable/external/ofsted-discovery \
+  --execute --accept-terms reports.ofsted.gov.uk --limit 25 --rate-limit 1
+```
+
+Import that reviewed CSV, run `discover-pdfs`, then dry-run a small explicit `--source-key` subset. Only after rechecking `files.ofsted.gov.uk` terms and robots should the same keys be run with `--execute --accept-terms files.ofsted.gov.uk --rate-limit 1`. Record the run manifest and integrity result before increasing either the authority or document limit.
 
 ## Site Scraper import for HTML material
 
